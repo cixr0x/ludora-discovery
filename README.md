@@ -28,11 +28,13 @@ From `C:\PROJECTS\ludora`:
 python .\scripts\collect_boardgame_stores_mx.py --query-scope expanded --verbose
 ```
 
-The script reads `BRAVE_SEARCH_API_KEY` and `LUDORA_DATABASE_URL` from `.env` by default:
+The script reads `BRAVE_SEARCH_API_KEY`, `LUDORA_DATABASE_URL`, and BGG configuration from `.env` by default:
 
 ```text
 BRAVE_SEARCH_API_KEY=your_brave_key_here
 LUDORA_DATABASE_URL=postgresql://user:password@localhost:5432/ludora
+BGG_API_TOKEN=your_bgg_token_here
+BGG_API_BASE_URL=https://boardgamegeek.com/xmlapi2
 ```
 
 You can still override them with environment variables, `--api-key`, or `--database-url`.
@@ -68,13 +70,30 @@ $env:PYTHONPATH='src'
 python -m ludora.api --host 127.0.0.1 --port 8001
 ```
 
-The API reads `BRAVE_SEARCH_API_KEY` and `LUDORA_DATABASE_URL` from `.env` by default, matching the CLI.
+The API reads `BRAVE_SEARCH_API_KEY`, `LUDORA_DATABASE_URL`, and `BGG_API_TOKEN` from `.env` by default, matching the CLI. For local development you can point it at the admin-service env file if that is where the shared credentials live:
+
+```powershell
+python -m ludora.api --host 127.0.0.1 --port 8001 --env-file ..\ludora-admin\ludora-admin-service\.env
+```
+
+Some stores block plain HTTP crawlers but allow a real browser session to read their product sitemap and product pages. Enable the browser-backed fallback before starting the API:
+
+```powershell
+$env:LUDORA_BROWSER_FETCH_ENABLED='true'
+```
+
+Browser fallback uses the installed Chrome executable when available. You can override it with:
+
+```powershell
+$env:LUDORA_BROWSER_EXECUTABLE_PATH='C:\Program Files\Google\Chrome\Application\chrome.exe'
+```
 
 Available endpoints:
 
 ```text
 GET  /health
 POST /operations/store-discovery-runs
+POST /operations/stores/{store_id}/item-discovery-runs
 GET  /operations/store-discovery-runs/latest
 GET  /operations/store-discovery-runs/{run_id}
 ```

@@ -1,0 +1,133 @@
+import sys
+import unittest
+from pathlib import Path
+
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
+from ludora.api import route_request
+from ludora.operations import ItemDiscoveryRunResult, OperationAlreadyRunning, StoreDiscoveryRunManager, StoreDiscoveryRunResult
+
+
+class DiscoveryApiTests(unittest.TestCase):
+    def test_health_route_returns_service_status(self):
+        status, payload = route_request(
+            "GET",
+            "/health",
+            StoreDiscoveryRunManager(
+                runner=lambda: StoreDiscoveryRunResult(0, 0, 0),
+                background=False,
+            ),
+        )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["status"], "ok")
+        self.assertEqual(payload["service"], "ludora-discovery-api")
+
+    def test_starts_and_reads_store_discovery_run(self):
+        manager = StoreDiscoveryRunManager(
+            runner=lambda: StoreDiscoveryRunResult(
+                searched_queries=2,
+                candidate_domains=5,
+                accepted_stores=3,
+            ),
+            background=False,
+        )
+
+        status, payload = route_request("POST", "/operations/store-discovery-runs", manager)
+
+        self.assertEqual(status, 202)
+        self.assertEqual(payload["data"]["type"], "store_discovery")
+        self.assertEqual(payload["data"]["status"], "completed")
+        self.assertEqual(payload["data"]["result"]["accepted_stores"], 3)
+
+        run_id = payload["data"]["id"]
+        get_status, get_payload = route_request("GET", f"/operations/store-discovery-runs/{run_id}", manager)
+
+        self.assertEqual(get_status, 200)
+        self.assertEqual(get_payload["data"]["id"], run_id)
+
+    def test_starts_item_discovery_run_for_one_store(self):
+        manager = StoreDiscoveryRunManager(
+            runner=lambda: StoreDiscoveryRunResult(0, 0, 0),
+            item_runner=lambda store_id, website_url: ItemDiscoveryRunResult(
+                store_id=store_id,
+                website_url=website_url,
+                item_candidates=5,
+            ),
+            background=False,
+        )
+
+        status, payload = route_request(
+            "POST",
+            "/operations/stores/12/item-discovery-runs",
+            manager,
+            {"website_url": "https://example.mx/"},
+        )
+
+        self.assertEqual(status, 202)
+        self.assertEqual(payload["data"]["type"], "item_discovery")
+        self.assertEqual(payload["data"]["status"], "completed")
+        self.assertEqual(payload["data"]["result"]["store_id"], 12)
+        self.assertEqual(payload["data"]["result"]["website_url"], "https://example.mx/")
+        self.assertEqual(payload["data"]["result"]["item_candidates"], 5)
+
+    def test_item_discovery_requires_valid_store_and_website_url(self):
+        manager = StoreDiscoveryRunManager(
+            runner=lambda: StoreDiscoveryRunResult(0, 0, 0),
+            background=False,
+        )
+
+        invalid_id_status, invalid_id_payload = route_request(
+            "POST",
+            "/operations/stores/not-a-number/item-discovery-runs",
+            manager,
+            {"website_url": "https://example.mx/"},
+        )
+        missing_url_status, missing_url_payload = route_request(
+            "POST",
+            "/operations/stores/12/item-discovery-runs",
+            manager,
+            {},
+        )
+
+        self.assertEqual(invalid_id_status, 400)
+        self.assertEqual(invalid_id_payload, {"error": {"message": "store id must be a positive integer"}})
+        self.assertEqual(missing_url_status, 400)
+        self.assertEqual(missing_url_payload, {"error": {"message": "website_url is required"}})
+
+    def test_latest_run_route_returns_null_before_any_run(self):
+        manager = StoreDiscoveryRunManager(
+            runner=lambda: StoreDiscoveryRunResult(0, 0, 0),
+            background=False,
+        )
+
+        status, payload = route_request("GET", "/operations/store-discovery-runs/latest", manager)
+
+        self.assertEqual(status, 200)
+        self.assertIsNone(payload["data"])
+
+    def test_returns_conflict_when_discovery_is_already_running(self):
+        class ConflictManager:
+            def start_store_discovery(self):
+                raise OperationAlreadyRunning("Store discovery is already running")
+
+        status, payload = route_request("POST", "/operations/store-discovery-runs", ConflictManager())
+
+        self.assertEqual(status, 409)
+        self.assertEqual(payload, {"error": {"message": "Store discovery is already running"}})
+
+    def test_unknown_run_returns_404(self):
+        manager = StoreDiscoveryRunManager(
+            runner=lambda: StoreDiscoveryRunResult(0, 0, 0),
+            background=False,
+        )
+
+        status, payload = route_request("GET", "/operations/store-discovery-runs/missing", manager)
+
+        self.assertEqual(status, 404)
+        self.assertEqual(payload, {"error": {"message": "Run not found"}})
+
+
+if __name__ == "__main__":
+    unittest.main()
