@@ -4,9 +4,6 @@ import json
 from dataclasses import dataclass
 from typing import Any
 
-from ludora.bgg import BggSearchResult
-from ludora.item_import import normalize_title
-from ludora.item_processing import CandidateOfferMatch, LocalItemMatch
 from ludora.models import DiscoveryItemCandidateRecord, StoreRecord
 
 
@@ -19,13 +16,9 @@ def connect_database(database_url: str):
 @dataclass(frozen=True)
 class ItemCandidateUpsertResult:
     candidate_id: int
-    status: str
+    listing_status: str
     item_id: int | None
     should_process: bool
-
-
-BGG_SEARCH_TYPE = "boardgame,boardgameexpansion"
-TERMINAL_AUTOMATION_STATUSES = {"REJECTED", "NOT_BOARDGAME", "MATCH_NOT_FOUND"}
 
 
 class DiscoveryRepository:
@@ -90,23 +83,10 @@ class DiscoveryRepository:
         data = record.to_db_dict()
         with self.connection.cursor() as cursor:
             existing = self._find_item_candidate(cursor, record)
-            if existing and existing[1] in TERMINAL_AUTOMATION_STATUSES:
-                cursor.execute(
-                    """
-                    update store_items
-                    set last_seen_at = now()
-                    where id = %s
-                    """,
-                    (existing[0],),
-                )
-                result = ItemCandidateUpsertResult(
-                    candidate_id=int(existing[0]),
-                    status=str(existing[1]),
-                    item_id=_optional_int(existing[2]),
-                    should_process=False,
-                )
-            elif existing:
-                data["status"] = str(existing[1])
+            if existing:
+                item_id = _optional_int(existing[2])
+                data["listing_status"] = str(existing[1])
+                data["item_id"] = item_id
                 cursor.execute(
                     _update_item_candidate_sql(),
                     (
@@ -114,19 +94,18 @@ class DiscoveryRepository:
                         existing[0],
                     ),
                 )
-                item_id = _optional_int(existing[2])
                 result = ItemCandidateUpsertResult(
                     candidate_id=int(existing[0]),
-                    status=str(existing[1]),
+                    listing_status=str(existing[1]),
                     item_id=item_id,
-                    should_process=str(existing[1]) == "NEW",
+                    should_process=item_id is None and not existing[3] and existing[4] is None,
                 )
             else:
                 cursor.execute(_insert_item_candidate_sql(), self._item_candidate_write_params(data))
                 row = cursor.fetchone()
                 result = ItemCandidateUpsertResult(
                     candidate_id=int(row[0]) if row else 0,
-                    status=str(row[1]) if row else str(data["status"]),
+                    listing_status=str(row[1]) if row else str(data["listing_status"]),
                     item_id=_optional_int(row[2]) if row else _optional_int(data["item_id"]),
                     should_process=True,
                 )
@@ -136,7 +115,7 @@ class DiscoveryRepository:
     def _find_item_candidate(self, cursor: Any, record: DiscoveryItemCandidateRecord):
         cursor.execute(
             """
-            select id, status, item_id
+            select id, listing_status, item_id, match_source, processed_at
             from store_items
             where store_id is not distinct from %s
               and source_url = %s
@@ -144,6 +123,39 @@ class DiscoveryRepository:
             (record.store_id, record.source_url),
         )
         return cursor.fetchone()
+
+    def item_candidate_exists(self, store_id: int | None, source_url: str) -> bool:
+        with self.connection.cursor() as cursor:
+            cursor.execute(
+                """
+                select 1
+                from store_items
+                where store_id is not distinct from %s
+                  and source_url = %s
+                limit 1
+                """,
+                (store_id, source_url),
+            )
+            return cursor.fetchone() is not None
+
+    def list_confirmed_boardgame_item_candidates(self, limit: int | None = None) -> list[DiscoveryItemCandidateRecord]:
+        sql = f"""
+            select {_item_candidate_select_columns()}
+            from store_items
+            where is_boardgame = true
+              and is_boardgame_confirmed = true
+              and item_id is not null
+              and source_url <> ''
+            order by last_updated asc, id asc
+        """
+        params: tuple[object, ...] = ()
+        if limit is not None:
+            sql += "\nlimit %s"
+            params = (limit,)
+
+        with self.connection.cursor() as cursor:
+            cursor.execute(sql, params)
+            return [_item_candidate_from_row(row) for row in cursor.fetchall()]
 
     def _item_candidate_write_params(self, data: dict[str, object]) -> tuple[object, ...]:
         return (
@@ -164,7 +176,7 @@ class DiscoveryRepository:
             data["language_source"],
             data["language_evidence"],
             data["image_url"],
-            data["status"],
+            data["listing_status"],
             data["raw_price"],
             data["price"],
             data["price_source"],
@@ -179,220 +191,11 @@ class DiscoveryRepository:
             json.dumps(data["classification_reasons"], ensure_ascii=False),
         )
 
-    def find_local_item_matches(self, title: str) -> list[LocalItemMatch]:
-        normalized_title = normalize_title(title)
-        with self.connection.cursor() as cursor:
-            cursor.execute(
-                """
-                select
-                    i.id,
-                    i.canonical_name,
-                    i.normalized_name,
-                    i.item_type,
-                    i.bgg_id,
-                    coalesce(json_agg(distinct ia.alias) filter (where ia.alias is not null), '[]'::json) as aliases
-                from items i
-                left join item_aliases ia on ia.item_id = i.id
-                where i.normalized_name = %s
-                   or ia.normalized_alias = %s
-                group by i.id, i.canonical_name, i.normalized_name, i.item_type, i.bgg_id
-                order by i.canonical_name asc
-                limit 20
-                """,
-                (normalized_title, normalized_title),
-            )
-            rows = cursor.fetchall()
-
-        return [
-            LocalItemMatch(
-                item_id=int(row[0]),
-                name=str(row[1] or ""),
-                normalized_name=str(row[2] or ""),
-                item_type=str(row[3] or "unknown"),
-                bgg_id=_optional_int(row[4]),
-                aliases=_json_string_list(row[5]),
-            )
-            for row in rows
-        ]
-
-    def get_bgg_search_cache(self, query: str, search_type: str = BGG_SEARCH_TYPE) -> list[BggSearchResult] | None:
-        normalized_query = normalize_title(query)
-        with self.connection.cursor() as cursor:
-            cursor.execute(
-                """
-                select id
-                from bgg_search_queries
-                where normalized_query = %s
-                  and search_type = %s
-                limit 1
-                """,
-                (normalized_query, search_type),
-            )
-            query_row = cursor.fetchone()
-            if not query_row:
-                return None
-
-            cursor.execute(
-                """
-                select
-                    c.bgg_id,
-                    c.name,
-                    c.item_type,
-                    c.year_published
-                from bgg_search_query_results qr
-                join bgg_search_cache c on c.id = qr.cache_id
-                where qr.query_id = %s
-                order by qr.result_rank asc
-                """,
-                (query_row[0],),
-            )
-            rows = cursor.fetchall()
-
-        return [
-            BggSearchResult(
-                bgg_id=int(row[0]),
-                name=str(row[1] or ""),
-                item_type=str(row[2] or ""),
-                year_published=_optional_int(row[3]),
-            )
-            for row in rows
-            if row[0] and row[1]
-        ]
-
-    def upsert_bgg_search_cache(
-        self,
-        query: str,
-        results: list[BggSearchResult],
-        search_type: str = BGG_SEARCH_TYPE,
-    ) -> None:
-        normalized_query = normalize_title(query)
-        with self.connection.cursor() as cursor:
-            cursor.execute(
-                """
-                insert into bgg_search_queries (
-                    query,
-                    normalized_query,
-                    search_type,
-                    result_count,
-                    fetched_at,
-                    updated_at
-                )
-                values (%s, %s, %s, %s, now(), now())
-                on conflict (normalized_query, search_type) do update set
-                    query = excluded.query,
-                    result_count = excluded.result_count,
-                    fetched_at = excluded.fetched_at,
-                    updated_at = now()
-                returning id
-                """,
-                (
-                    query,
-                    normalized_query,
-                    search_type,
-                    len(results),
-                ),
-            )
-            query_row = cursor.fetchone()
-            query_id = int(query_row[0])
-            cursor.execute(
-                """
-                delete from bgg_search_query_results
-                where query_id = %s
-                """,
-                (query_id,),
-            )
-            for rank, result in enumerate(results):
-                cursor.execute(
-                    """
-                    insert into bgg_search_cache (
-                        bgg_id,
-                        name,
-                        item_type,
-                        year_published,
-                        result_json,
-                        updated_at
-                    )
-                    values (%s, %s, %s, %s, %s::jsonb, now())
-                    on conflict (bgg_id) do update set
-                        name = excluded.name,
-                        item_type = excluded.item_type,
-                        year_published = excluded.year_published,
-                        result_json = excluded.result_json,
-                        updated_at = now()
-                    returning id
-                    """,
-                    (
-                        result.bgg_id,
-                        result.name,
-                        result.item_type,
-                        result.year_published,
-                        json.dumps(_bgg_search_result_payload(result), ensure_ascii=False),
-                    ),
-                )
-                cache_row = cursor.fetchone()
-                cursor.execute(
-                    """
-                    insert into bgg_search_query_results (
-                        query_id,
-                        cache_id,
-                        result_rank
-                    )
-                    values (%s, %s, %s)
-                    on conflict (query_id, cache_id) do update set
-                        result_rank = excluded.result_rank
-                    """,
-                    (query_id, int(cache_row[0]), rank),
-                )
-        self.connection.commit()
-
-    def link_item_to_store_item(
-        self,
-        candidate_id: int,
-        record: DiscoveryItemCandidateRecord,
-        match: CandidateOfferMatch,
-    ) -> None:
-        if record.store_id is None:
-            raise ValueError("Cannot list a store item without a store id")
-
-        with self.connection.cursor() as cursor:
-            cursor.execute(
-                """
-                update store_items
-                set item_id = %s,
-                    is_boardgame = true,
-                    is_boardgame_confirmed = true,
-                    status = 'LISTED',
-                    match_source = %s,
-                    matched_bgg_id = %s,
-                    matched_name = %s,
-                    match_score = %s,
-                    match_reasons = %s::jsonb,
-                    match_payload = %s::jsonb,
-                    matched_at = now(),
-                    processed_at = now(),
-                    processing_error = '',
-                    last_updated = now()
-                where id = %s
-                """,
-                (
-                    match.item_id,
-                    match.source,
-                    match.bgg_id,
-                    match.matched_name,
-                    match.score,
-                    json.dumps(match.reasons, ensure_ascii=False),
-                    json.dumps(match.payload, ensure_ascii=False),
-                    candidate_id,
-                ),
-            )
-
-        self.connection.commit()
-
     def mark_item_candidate_not_boardgame(self, candidate_id: int, reasons: list[str]) -> None:
-        self._mark_item_candidate_terminal_status(candidate_id, "NOT_BOARDGAME", reasons)
+        self._mark_item_candidate_no_match(candidate_id, reasons)
 
     def mark_item_candidate_match_not_found(self, candidate_id: int, reasons: list[str]) -> None:
-        self._mark_item_candidate_terminal_status(candidate_id, "MATCH_NOT_FOUND", reasons)
+        self._mark_item_candidate_no_match(candidate_id, reasons)
 
     def mark_item_candidate_processing_error(self, candidate_id: int, error: str) -> None:
         with self.connection.cursor() as cursor:
@@ -408,13 +211,12 @@ class DiscoveryRepository:
             )
         self.connection.commit()
 
-    def _mark_item_candidate_terminal_status(self, candidate_id: int, status: str, reasons: list[str]) -> None:
+    def _mark_item_candidate_no_match(self, candidate_id: int, reasons: list[str]) -> None:
         with self.connection.cursor() as cursor:
             cursor.execute(
                 """
                 update store_items
-                set status = %s,
-                    match_source = 'NONE',
+                set match_source = 'NONE',
                     match_reasons = %s::jsonb,
                     match_payload = '{}'::jsonb,
                     processed_at = now(),
@@ -422,7 +224,7 @@ class DiscoveryRepository:
                     last_updated = now()
                 where id = %s
                 """,
-                (status, json.dumps(reasons, ensure_ascii=False), candidate_id),
+                (json.dumps(reasons, ensure_ascii=False), candidate_id),
             )
         self.connection.commit()
 
@@ -447,7 +249,7 @@ def _insert_item_candidate_sql() -> str:
         language_source,
         language_evidence,
         image_url,
-        status,
+        listing_status,
         raw_price,
         price,
         price_source,
@@ -464,7 +266,7 @@ def _insert_item_candidate_sql() -> str:
         last_updated
     )
     values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s, %s::jsonb, now(), now())
-    returning id, status, item_id
+    returning id, listing_status, item_id
     """
 
 
@@ -488,7 +290,7 @@ def _update_item_candidate_sql() -> str:
         language_source = %s,
         language_evidence = %s,
         image_url = %s,
-        status = %s,
+        listing_status = %s,
         raw_price = %s,
         price = %s,
         price_source = %s,
@@ -507,66 +309,125 @@ def _update_item_candidate_sql() -> str:
     """
 
 
+def _item_candidate_select_columns() -> str:
+    return """
+        store_id,
+        source_url,
+        source_listing_url,
+        title,
+        publisher,
+        description,
+        item_id,
+        item_type,
+        min_players,
+        max_players,
+        min_minutes,
+        max_minutes,
+        min_age,
+        language,
+        language_source,
+        language_evidence,
+        image_url,
+        listing_status,
+        raw_price,
+        price,
+        price_source,
+        currency,
+        availability,
+        availability_source,
+        store_sku,
+        raw_payload,
+        is_boardgame,
+        is_boardgame_confirmed,
+        category_confidence,
+        classification_reasons,
+        match_source,
+        matched_bgg_id,
+        matched_name,
+        match_score,
+        match_reasons,
+        match_payload,
+        matched_at,
+        processed_at,
+        processing_error
+    """
+
+
+def _item_candidate_from_row(row: Any) -> DiscoveryItemCandidateRecord:
+    return DiscoveryItemCandidateRecord(
+        store_id=_optional_int(row[0]),
+        source_url=_text(row[1]),
+        source_listing_url=_text(row[2]),
+        title=_text(row[3]),
+        publisher=_text(row[4]),
+        description=_text(row[5]),
+        item_id=_optional_int(row[6]),
+        item_type=_text(row[7]) or "unknown",
+        min_players=_optional_int(row[8]),
+        max_players=_optional_int(row[9]),
+        min_minutes=_optional_int(row[10]),
+        max_minutes=_optional_int(row[11]),
+        min_age=_optional_int(row[12]),
+        language=_text(row[13]),
+        language_source=_text(row[14]),
+        language_evidence=_text(row[15]),
+        image_url=_text(row[16]),
+        listing_status=_text(row[17]) or "PENDING",
+        raw_price=_text(row[18]),
+        price=_text(row[19]),
+        price_source=_text(row[20]) or "none",
+        currency=_text(row[21]) or "MXN",
+        availability=_text(row[22]) or "unknown",
+        availability_source=_text(row[23]) or "none",
+        store_sku=_text(row[24]),
+        raw_payload=_json_object(row[25]),
+        is_boardgame=bool(row[26]),
+        is_boardgame_confirmed=bool(row[27]),
+        category_confidence=_optional_float(row[28]),
+        classification_reasons=_json_list(row[29]),
+        match_source=_text(row[30]),
+        matched_bgg_id=_optional_int(row[31]),
+        matched_name=_text(row[32]),
+        match_score=_optional_float(row[33]),
+        match_reasons=_json_list(row[34]),
+        match_payload=_json_object(row[35]),
+        matched_at=_text(row[36]) or None,
+        processed_at=_text(row[37]) or None,
+        processing_error=_text(row[38]),
+    )
+
+
 def _optional_int(value: object) -> int | None:
     if value is None or value == "":
         return None
     return int(value)
 
 
-def _json_string_list(value: object) -> list[str]:
-    if isinstance(value, list):
-        return [str(item) for item in value if str(item)]
-    if isinstance(value, str):
-        try:
-            parsed = json.loads(value)
-        except json.JSONDecodeError:
-            return [value] if value else []
-        return _json_string_list(parsed)
-    return []
-
-
-def _bgg_search_result_payload(result: BggSearchResult) -> dict[str, object]:
-    return {
-        "bggId": result.bgg_id,
-        "name": result.name,
-        "type": result.item_type,
-        "yearPublished": result.year_published,
-    }
-
-
-def _bgg_search_results(value: object) -> list[BggSearchResult]:
-    parsed = _json_value(value)
-    if not isinstance(parsed, list):
-        return []
-
-    results: list[BggSearchResult] = []
-    for item in parsed:
-        if isinstance(item, dict):
-            result = _bgg_search_result(item)
-            if result:
-                results.append(result)
-    return results
-
-
-def _bgg_search_result(value: dict[object, object]) -> BggSearchResult | None:
-    bgg_id = _optional_int(value.get("bggId") or value.get("bgg_id"))
-    name = str(value.get("name") or "").strip()
-    item_type = str(value.get("type") or value.get("item_type") or "").strip()
-    year_published = _optional_int(value.get("yearPublished") or value.get("year_published"))
-    if not bgg_id or not name:
+def _optional_float(value: object) -> float | None:
+    if value is None or value == "":
         return None
-    return BggSearchResult(
-        bgg_id=bgg_id,
-        name=name,
-        item_type=item_type,
-        year_published=year_published,
-    )
+    return float(value)
 
 
-def _json_value(value: object) -> object:
-    if isinstance(value, str):
-        try:
-            return json.loads(value)
-        except json.JSONDecodeError:
-            return None
-    return value
+def _text(value: object) -> str:
+    if value is None:
+        return ""
+    return str(value)
+
+
+def _json_object(value: object) -> dict[str, object]:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str) and value:
+        parsed = json.loads(value)
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
+
+
+def _json_list(value: object) -> list[str]:
+    if isinstance(value, list):
+        return [str(item) for item in value]
+    if isinstance(value, str) and value:
+        parsed = json.loads(value)
+        return [str(item) for item in parsed] if isinstance(parsed, list) else []
+    return []

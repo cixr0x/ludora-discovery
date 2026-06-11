@@ -6,9 +6,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from ludora.bgg import BggSearchResult
 from ludora.database import DiscoveryRepository
-from ludora.item_processing import CandidateOfferMatch
 from ludora.models import DiscoveryItemCandidateRecord, StoreRecord
 
 
@@ -181,13 +179,14 @@ class DatabaseRepositoryTests(unittest.TestCase):
         self.assertEqual(json.loads(params[29]), ["player count found", "boardgame category found"])
         self.assertEqual(connection.commits, 1)
 
-    def test_upsert_terminal_item_candidate_only_updates_last_seen(self):
-        connection = FakeConnection(fetchone_rows=[(55, "MATCH_NOT_FOUND", None)])
+    def test_upsert_existing_item_candidate_preserves_listing_status_and_refreshes_data(self):
+        connection = FakeConnection(fetchone_rows=[(55, "REJECTED", None, "NONE", "2026-05-01T00:00:00Z")])
         repository = DiscoveryRepository(connection)
         record = DiscoveryItemCandidateRecord(
             store_id=12,
             source_url="https://example.mx/products/unknown",
             title="Unknown Product",
+            image_url="https://example.mx/products/unknown.jpg",
             raw_price="$100",
             price="100.00",
             availability="available",
@@ -202,11 +201,13 @@ class DatabaseRepositoryTests(unittest.TestCase):
         normalized_sql = sql.casefold()
         self.assertIn("update store_items", normalized_sql)
         self.assertIn("last_seen_at = now()", normalized_sql)
-        self.assertNotIn("raw_price", normalized_sql)
-        self.assertEqual(params, (55,))
+        self.assertIn("raw_price = %s", normalized_sql)
+        self.assertIn("listing_status = %s", normalized_sql)
+        self.assertEqual(params[16], "https://example.mx/products/unknown.jpg")
+        self.assertEqual(params[17], "REJECTED")
 
-    def test_upsert_listed_store_item_refreshes_store_item_only(self):
-        connection = FakeConnection(fetchone_rows=[(56, "LISTED", 7)])
+    def test_upsert_linked_store_item_refreshes_store_item_only(self):
+        connection = FakeConnection(fetchone_rows=[(56, "LISTED", 7, "LOCAL", "2026-05-01T00:00:00Z")])
         repository = DiscoveryRepository(connection)
         record = DiscoveryItemCandidateRecord(
             store_id=12,
@@ -230,128 +231,97 @@ class DatabaseRepositoryTests(unittest.TestCase):
         self.assertIn("update store_items", candidate_sql.casefold())
         self.assertIn("raw_price = %s", candidate_sql.casefold())
         self.assertEqual(candidate_params[17], "LISTED")
+        self.assertEqual(candidate_params[6], 7)
 
-    def test_find_local_item_matches_returns_aliases_for_exact_candidates(self):
+    def test_item_candidate_exists_checks_store_and_source_url(self):
+        connection = FakeConnection(fetchone_rows=[(1,)])
+        repository = DiscoveryRepository(connection)
+
+        exists = repository.item_candidate_exists(12, "https://example.mx/products/catan")
+
+        self.assertTrue(exists)
+        sql, params = connection.cursor_instance.executions[0]
+        normalized_sql = sql.casefold()
+        self.assertIn("from store_items", normalized_sql)
+        self.assertIn("store_id is not distinct from %s", normalized_sql)
+        self.assertIn("source_url = %s", normalized_sql)
+        self.assertEqual(params, (12, "https://example.mx/products/catan"))
+        self.assertEqual(connection.commits, 0)
+
+    def test_lists_confirmed_boardgame_item_candidates_for_updates(self):
         connection = FakeConnection(
             fetchall_rows=[
                 [
                     (
-                        7,
+                        12,
+                        "https://example.mx/products/catan",
+                        "https://example.mx/sitemap.xml",
                         "Catan",
-                        "catan",
+                        "Devir",
+                        "Juego base",
+                        77,
                         "base_game",
+                        3,
+                        4,
+                        60,
+                        90,
+                        10,
+                        "es",
+                        "product_highlights",
+                        "3-4 jugadores",
+                        "https://example.mx/catan.jpg",
+                        "LISTED",
+                        "$899",
+                        "899.00",
+                        "json_ld_offer",
+                        "MXN",
+                        "available",
+                        "json_ld_offer",
+                        "CATAN-ES",
+                        '{"json_ld": {"name": "Catan"}}',
+                        True,
+                        True,
+                        0.91,
+                        '["previously confirmed"]',
+                        "LOCAL",
                         13,
-                        '["Los Colonos de Catan"]',
+                        "Catan",
+                        0.96,
+                        '["name match"]',
+                        '{"source": "local"}',
+                        "2026-05-01T00:00:00Z",
+                        "2026-05-01T00:00:00Z",
+                        "",
                     )
                 ]
             ]
         )
         repository = DiscoveryRepository(connection)
 
-        matches = repository.find_local_item_matches("Los Colonos de Catan")
+        records = repository.list_confirmed_boardgame_item_candidates(limit=50)
 
         sql, params = connection.cursor_instance.executions[0]
-        self.assertIn("from items i", sql.casefold())
-        self.assertIn("left join item_aliases", sql.casefold())
-        self.assertEqual(params, ("los colonos de catan", "los colonos de catan"))
-        self.assertEqual(len(matches), 1)
-        self.assertEqual(matches[0].item_id, 7)
-        self.assertEqual(matches[0].aliases, ["Los Colonos de Catan"])
+        normalized_sql = sql.casefold()
+        self.assertIn("from store_items", normalized_sql)
+        self.assertIn("is_boardgame = true", normalized_sql)
+        self.assertIn("is_boardgame_confirmed = true", normalized_sql)
+        self.assertIn("item_id is not null", normalized_sql)
+        self.assertIn("source_url <> ''", normalized_sql)
+        self.assertIn("order by last_updated asc, id asc", normalized_sql)
+        self.assertIn("limit %s", normalized_sql)
+        self.assertEqual(params, (50,))
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0].store_id, 12)
+        self.assertEqual(records[0].source_url, "https://example.mx/products/catan")
+        self.assertEqual(records[0].item_id, 77)
+        self.assertTrue(records[0].is_boardgame)
+        self.assertTrue(records[0].is_boardgame_confirmed)
+        self.assertEqual(records[0].raw_payload, {"json_ld": {"name": "Catan"}})
+        self.assertEqual(records[0].classification_reasons, ["previously confirmed"])
+        self.assertEqual(records[0].match_payload, {"source": "local"})
+        self.assertEqual(connection.commits, 0)
 
-    def test_get_bgg_search_cache_returns_cached_results(self):
-        connection = FakeConnection(
-            fetchone_rows=[
-                (91,),
-            ],
-            fetchall_rows=[
-                [
-                    (377061, "Coffee Rush", "boardgame", 2023),
-                ],
-            ]
-        )
-        repository = DiscoveryRepository(connection)
-
-        results = repository.get_bgg_search_cache("Cafe Barista")
-
-        query_sql, query_params = connection.cursor_instance.executions[0]
-        result_sql, result_params = connection.cursor_instance.executions[1]
-        self.assertIn("from bgg_search_queries", query_sql.casefold())
-        self.assertIn("normalized_query = %s", query_sql.casefold())
-        self.assertIn("search_type = %s", query_sql.casefold())
-        self.assertEqual(query_params, ("cafe barista", "boardgame,boardgameexpansion"))
-        self.assertIn("from bgg_search_query_results", result_sql.casefold())
-        self.assertIn("join bgg_search_cache", result_sql.casefold())
-        self.assertEqual(result_params, (91,))
-        self.assertEqual(
-            results,
-            [BggSearchResult(bgg_id=377061, name="Coffee Rush", item_type="boardgame", year_published=2023)],
-        )
-
-    def test_upsert_bgg_search_cache_writes_query_results(self):
-        connection = FakeConnection(fetchone_rows=[(91,), (92,)])
-        repository = DiscoveryRepository(connection)
-        results = [BggSearchResult(bgg_id=377061, name="Coffee Rush", item_type="boardgame", year_published=2023)]
-
-        repository.upsert_bgg_search_cache("Cafe Barista", results)
-
-        query_sql, query_params = connection.cursor_instance.executions[0]
-        delete_sql, delete_params = connection.cursor_instance.executions[1]
-        cache_sql, cache_params = connection.cursor_instance.executions[2]
-        mapping_sql, mapping_params = connection.cursor_instance.executions[3]
-        self.assertIn("insert into bgg_search_queries", query_sql.casefold())
-        self.assertIn("on conflict (normalized_query, search_type)", query_sql.casefold())
-        self.assertEqual(query_params[0], "Cafe Barista")
-        self.assertEqual(query_params[1], "cafe barista")
-        self.assertEqual(query_params[2], "boardgame,boardgameexpansion")
-        self.assertEqual(query_params[3], 1)
-        self.assertIn("delete from bgg_search_query_results", delete_sql.casefold())
-        self.assertEqual(delete_params, (91,))
-        self.assertIn("insert into bgg_search_cache", cache_sql.casefold())
-        self.assertIn("on conflict (bgg_id)", cache_sql.casefold())
-        self.assertEqual(cache_params[0], 377061)
-        self.assertEqual(cache_params[1], "Coffee Rush")
-        self.assertEqual(cache_params[2], "boardgame")
-        self.assertEqual(cache_params[3], 2023)
-        self.assertEqual(json.loads(cache_params[4]), {"bggId": 377061, "name": "Coffee Rush", "type": "boardgame", "yearPublished": 2023})
-        self.assertIn("insert into bgg_search_query_results", mapping_sql.casefold())
-        self.assertEqual(mapping_params, (91, 92, 0))
-        self.assertEqual(connection.commits, 1)
-
-    def test_link_item_to_store_item_marks_store_item_listed(self):
-        connection = FakeConnection()
-        repository = DiscoveryRepository(connection)
-        record = DiscoveryItemCandidateRecord(
-            store_id=12,
-            source_url="https://example.mx/products/catan",
-            title="Catan",
-            publisher="Devir",
-            language="es",
-            price="899.00",
-            availability="available",
-        )
-        match = CandidateOfferMatch(
-            item_id=7,
-            source="LOCAL",
-            matched_name="Catan",
-            score=0.94,
-            reasons=["exact local item name match"],
-            bgg_id=13,
-            payload={"item": {"id": 7}},
-        )
-
-        repository.link_item_to_store_item(56, record, match)
-
-        candidate_sql, candidate_params = connection.cursor_instance.executions[0]
-        self.assertIn("update store_items", candidate_sql.casefold())
-        self.assertIn("status = 'LISTED'", candidate_sql)
-        self.assertIn("is_boardgame_confirmed = true", candidate_sql.casefold())
-        self.assertIn("match_source = %s", candidate_sql)
-        self.assertEqual(candidate_params[0], 7)
-        self.assertEqual(candidate_params[1], "LOCAL")
-        self.assertEqual(candidate_params[-1], 56)
-        self.assertEqual(connection.commits, 1)
-
-    def test_marks_automated_terminal_candidate_statuses(self):
+    def test_marks_processing_state_without_listing_status_changes(self):
         connection = FakeConnection()
         repository = DiscoveryRepository(connection)
 
@@ -362,10 +332,12 @@ class DatabaseRepositoryTests(unittest.TestCase):
         status_sql, status_params = connection.cursor_instance.executions[0]
         missing_sql, missing_params = connection.cursor_instance.executions[1]
         error_sql, error_params = connection.cursor_instance.executions[2]
-        self.assertIn("status = %s", status_sql.casefold())
-        self.assertEqual(status_params[0], "NOT_BOARDGAME")
+        self.assertNotIn("listing_status", status_sql.casefold())
+        self.assertNotIn("status = %s", status_sql.casefold())
+        self.assertIn("match_source = 'NONE'", status_sql)
+        self.assertEqual(json.loads(status_params[0]), ["non-boardgame terms found: sleeves"])
         self.assertEqual(status_params[-1], 56)
-        self.assertEqual(missing_params[0], "MATCH_NOT_FOUND")
+        self.assertEqual(json.loads(missing_params[0]), ["no match above threshold"])
         self.assertEqual(missing_params[-1], 57)
         self.assertIn("processing_error = %s", error_sql.casefold())
         self.assertEqual(error_params, ("BGG client is not configured", 58))

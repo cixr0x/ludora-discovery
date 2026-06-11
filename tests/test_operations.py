@@ -10,10 +10,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from ludora.collector import CollectionSummary
 from ludora.operations import (
     ItemDiscoveryRunResult,
+    ItemUpdateRunResult,
     OperationAlreadyRunning,
     StoreDiscoveryRunManager,
     StoreDiscoveryRunResult,
     run_item_discovery,
+    run_item_update,
     run_store_discovery,
 )
 
@@ -75,27 +77,19 @@ class StoreDiscoveryOperationsTests(unittest.TestCase):
         repository = Mock()
         records = [object(), object(), object()]
 
-        bgg_client = object()
-        bgg_importer = object()
         item_processor = object()
 
         with patch("ludora.operations.resolve_database_url", return_value="postgresql://ludora") as resolve_database_url, patch(
             "ludora.operations.resolve_browser_fetch_enabled", return_value=True
         ) as resolve_browser_fetch_enabled, patch(
-            "ludora.operations.resolve_bgg_api_token", return_value="bgg-token"
-        ) as resolve_bgg_api_token, patch(
-            "ludora.operations.resolve_bgg_api_base_url", return_value="https://bgg.test/xmlapi2"
-        ) as resolve_bgg_api_base_url, patch(
+            "ludora.operations.resolve_admin_api_url", return_value="http://admin.test"
+        ) as resolve_admin_api_url, patch(
             "ludora.operations.connect_database", return_value=connection
         ) as connect_database, patch(
             "ludora.operations.DiscoveryRepository", return_value=repository
         ), patch(
-            "ludora.operations.BggClient", return_value=bgg_client
-        ) as bgg_client_factory, patch(
-            "ludora.operations.BggItemImporter", return_value=bgg_importer
-        ) as bgg_importer_factory, patch(
-            "ludora.operations.ItemCandidateProcessor", return_value=item_processor
-        ) as item_processor_factory, patch(
+            "ludora.operations.AdminItemMatcher", return_value=item_processor
+        ) as admin_item_matcher, patch(
             "ludora.operations.collect_store_inventory", return_value=records
         ) as collect_store_inventory:
             result = run_item_discovery(store_id=12, website_url="https://example.mx/", env_file="custom.env")
@@ -104,14 +98,10 @@ class StoreDiscoveryOperationsTests(unittest.TestCase):
         self.assertEqual(resolve_database_url.call_args.kwargs["dotenv_path"], "custom.env")
         resolve_browser_fetch_enabled.assert_called_once()
         self.assertEqual(resolve_browser_fetch_enabled.call_args.kwargs["dotenv_path"], "custom.env")
-        resolve_bgg_api_token.assert_called_once()
-        self.assertEqual(resolve_bgg_api_token.call_args.kwargs["dotenv_path"], "custom.env")
-        resolve_bgg_api_base_url.assert_called_once()
-        self.assertEqual(resolve_bgg_api_base_url.call_args.kwargs["dotenv_path"], "custom.env")
+        resolve_admin_api_url.assert_called_once()
+        self.assertEqual(resolve_admin_api_url.call_args.kwargs["dotenv_path"], "custom.env")
         connect_database.assert_called_once_with("postgresql://ludora")
-        bgg_client_factory.assert_called_once_with(api_token="bgg-token", base_url="https://bgg.test/xmlapi2")
-        bgg_importer_factory.assert_called_once_with(connection, bgg_client=bgg_client)
-        item_processor_factory.assert_called_once_with(repository, bgg_client=bgg_client, bgg_importer=bgg_importer)
+        admin_item_matcher.assert_called_once_with("http://admin.test", repository)
         collect_store_inventory.assert_called_once_with(
             "https://example.mx/",
             12,
@@ -123,6 +113,34 @@ class StoreDiscoveryOperationsTests(unittest.TestCase):
         self.assertEqual(result.store_id, 12)
         self.assertEqual(result.website_url, "https://example.mx/")
         self.assertEqual(result.item_candidates, 3)
+
+    def test_run_item_update_refreshes_confirmed_boardgames_and_closes_database(self):
+        connection = Mock()
+        repository = Mock()
+        records = [object(), object()]
+
+        with patch("ludora.operations.resolve_database_url", return_value="postgresql://ludora") as resolve_database_url, patch(
+            "ludora.operations.resolve_browser_fetch_enabled", return_value=True
+        ) as resolve_browser_fetch_enabled, patch(
+            "ludora.operations.connect_database", return_value=connection
+        ) as connect_database, patch(
+            "ludora.operations.DiscoveryRepository", return_value=repository
+        ), patch(
+            "ludora.operations.update_confirmed_store_items", return_value=records
+        ) as update_confirmed_store_items:
+            result = run_item_update(env_file="custom.env")
+
+        resolve_database_url.assert_called_once()
+        self.assertEqual(resolve_database_url.call_args.kwargs["dotenv_path"], "custom.env")
+        resolve_browser_fetch_enabled.assert_called_once()
+        self.assertEqual(resolve_browser_fetch_enabled.call_args.kwargs["dotenv_path"], "custom.env")
+        connect_database.assert_called_once_with("postgresql://ludora")
+        update_confirmed_store_items.assert_called_once_with(
+            repository,
+            browser_fetch_enabled=True,
+        )
+        connection.close.assert_called_once_with()
+        self.assertEqual(result.updated_items, 2)
 
     def test_manager_records_successful_run_result(self):
         manager = StoreDiscoveryRunManager(
@@ -160,6 +178,20 @@ class StoreDiscoveryOperationsTests(unittest.TestCase):
         self.assertEqual(run.result.store_id, 12)
         self.assertEqual(manager.get_latest_run().id, run.id)
 
+    def test_manager_records_successful_item_update_run_result(self):
+        manager = StoreDiscoveryRunManager(
+            runner=lambda: StoreDiscoveryRunResult(0, 0, 0),
+            item_update_runner=lambda: ItemUpdateRunResult(updated_items=6),
+            background=False,
+        )
+
+        run = manager.start_item_update()
+
+        self.assertEqual(run.status, "completed")
+        self.assertEqual(run.run_type, "item_update")
+        self.assertEqual(run.result.updated_items, 6)
+        self.assertEqual(manager.get_latest_run().id, run.id)
+
     def test_manager_passes_env_file_to_default_runners(self):
         with patch(
             "ludora.operations.run_store_discovery",
@@ -167,14 +199,19 @@ class StoreDiscoveryOperationsTests(unittest.TestCase):
         ) as store_runner, patch(
             "ludora.operations.run_item_discovery",
             return_value=ItemDiscoveryRunResult(12, "https://example.mx/", 4),
-        ) as item_runner:
+        ) as item_runner, patch(
+            "ludora.operations.run_item_update",
+            return_value=ItemUpdateRunResult(5),
+        ) as item_update_runner:
             manager = StoreDiscoveryRunManager(env_file="custom.env", background=False)
 
             manager.start_store_discovery()
             manager.start_item_discovery(12, "https://example.mx/")
+            manager.start_item_update()
 
         store_runner.assert_called_once_with(env_file="custom.env")
         item_runner.assert_called_once_with(store_id=12, website_url="https://example.mx/", env_file="custom.env")
+        item_update_runner.assert_called_once_with(env_file="custom.env")
 
     def test_manager_records_failed_run_error(self):
         manager = StoreDiscoveryRunManager(

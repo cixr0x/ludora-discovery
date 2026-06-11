@@ -8,18 +8,31 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from ludora.database import ItemCandidateUpsertResult
 from ludora.inventory import collect_store_inventory
-from ludora.product_crawler import crawl_store_product_details
+from ludora.models import DiscoveryItemCandidateRecord
+from ludora.product_crawler import crawl_store_product_details, update_confirmed_store_item_details
 from ludora.webfetch import FetchResult
 
 
 class FakeRepository:
-    def __init__(self, upsert_result=None):
+    def __init__(self, upsert_result=None, existing_urls=None, confirmed_items=None):
         self.item_records = []
         self.upsert_result = upsert_result
+        self.existing_urls = set(existing_urls or [])
+        self.exists_checks = []
+        self.confirmed_items = list(confirmed_items or [])
+        self.confirmed_items_limit = None
+
+    def item_candidate_exists(self, store_id, source_url):
+        self.exists_checks.append((store_id, source_url))
+        return (store_id, source_url) in self.existing_urls
 
     def upsert_item_candidate(self, record):
         self.item_records.append(record)
         return self.upsert_result
+
+    def list_confirmed_boardgame_item_candidates(self, limit=None):
+        self.confirmed_items_limit = limit
+        return self.confirmed_items
 
 
 class FakeItemProcessor:
@@ -164,7 +177,7 @@ class InventoryTests(unittest.TestCase):
         </script>
         """
         repository = FakeRepository(
-            ItemCandidateUpsertResult(candidate_id=101, status="NEW", item_id=None, should_process=True)
+            ItemCandidateUpsertResult(candidate_id=101, listing_status="PENDING", item_id=None, should_process=True)
         )
         processor = FakeItemProcessor()
 
@@ -193,7 +206,7 @@ class InventoryTests(unittest.TestCase):
         </script>
         """
         repository = FakeRepository(
-            ItemCandidateUpsertResult(candidate_id=102, status="MATCH_NOT_FOUND", item_id=None, should_process=False)
+            ItemCandidateUpsertResult(candidate_id=102, listing_status="PENDING", item_id=None, should_process=False)
         )
         processor = FakeItemProcessor()
 
@@ -212,6 +225,68 @@ class InventoryTests(unittest.TestCase):
             )
 
         self.assertEqual(processor.processed, [])
+
+    def test_crawl_store_product_details_skips_existing_product_urls_before_fetching_details(self):
+        product_url = "https://example.mx/products/catan"
+        repository = FakeRepository(existing_urls={(12, product_url)})
+
+        with patch(
+            "ludora.product_crawler.discover_product_urls_from_sitemaps",
+            return_value=[product_url],
+        ), patch("ludora.product_crawler.fetch_html") as fetch_html:
+            records = crawl_store_product_details(
+                "https://example.mx/",
+                12,
+                repository,
+            )
+
+        fetch_html.assert_not_called()
+        self.assertEqual(records, [])
+        self.assertEqual(repository.item_records, [])
+        self.assertEqual(repository.exists_checks, [(12, product_url)])
+
+    def test_update_confirmed_store_item_details_refreshes_only_confirmed_boardgame_rows(self):
+        detail_html = """
+        <script type="application/ld+json">
+        {
+          "@type": "Product",
+          "name": "Catan Nueva Edicion",
+          "description": "Juego de mesa para 3 a 4 jugadores.",
+          "offers": {"price": "799.00", "priceCurrency": "MXN"}
+        }
+        </script>
+        """
+        existing_record = DiscoveryItemCandidateRecord(
+            store_id=12,
+            source_url="https://example.mx/products/catan",
+            source_listing_url="https://example.mx/sitemap.xml",
+            title="Catan",
+            item_id=77,
+            listing_status="LISTED",
+            is_boardgame=True,
+            is_boardgame_confirmed=True,
+            category_confidence=0.91,
+            classification_reasons=["previously confirmed"],
+        )
+        repository = FakeRepository(confirmed_items=[existing_record])
+
+        with patch(
+            "ludora.product_crawler.fetch_html",
+            return_value=FetchResult(url="https://example.mx/products/catan", text=detail_html),
+        ) as fetch_html:
+            records = update_confirmed_store_item_details(repository, limit=25)
+
+        fetch_html.assert_called_once_with("https://example.mx/products/catan")
+        self.assertEqual(repository.confirmed_items_limit, 25)
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0].title, "Catan Nueva Edicion")
+        self.assertEqual(records[0].price, "799.00")
+        self.assertEqual(repository.item_records[0].item_id, 77)
+        self.assertEqual(repository.item_records[0].listing_status, "LISTED")
+        self.assertTrue(repository.item_records[0].is_boardgame)
+        self.assertTrue(repository.item_records[0].is_boardgame_confirmed)
+        self.assertEqual(repository.item_records[0].category_confidence, 0.91)
+        self.assertEqual(repository.item_records[0].classification_reasons, ["previously confirmed"])
 
 
 if __name__ == "__main__":

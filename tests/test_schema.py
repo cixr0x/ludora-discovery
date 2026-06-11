@@ -169,11 +169,14 @@ class SchemaTests(unittest.TestCase):
         self.assertIn("classification_reasons jsonb not null default '[]'::jsonb", item_candidate_table)
         self.assertIn("last_seen_at timestamptz not null default now()", item_candidate_table)
         self.assertIn("last_updated timestamptz not null default now()", item_candidate_table)
-        self.assertIn("status text not null default 'new'", item_candidate_table)
+        self.assertNotIn("status text not null default 'new'", item_candidate_table)
+        self.assertIn("listing_status text not null default 'pending'", item_candidate_table)
         self.assertIn(
-            "status in ('new', 'rejected', 'not_boardgame', 'listed', 'unlisted', 'needs_review', 'match_not_found')",
+            "listing_status in ('pending', 'listed', 'unlisted', 'rejected')",
             schema,
         )
+        self.assertIn("update store_items set listing_status = 'pending'", schema)
+        self.assertIn("alter table if exists store_items drop column if exists status", schema)
         self.assertIn("unique (store_id, source_url)", item_candidate_table)
         self.assertIn(
             "alter table if exists store_items drop constraint if exists discovery_item_candidates_store_id_source_url_title_key",
@@ -181,6 +184,21 @@ class SchemaTests(unittest.TestCase):
         )
         self.assertIn("store_items_store_id_source_url_key", schema)
         self.assertIn("alter table if exists store_items drop column if exists offer_id", schema)
+
+    def test_schema_contains_active_item_view(self):
+        schema_path = Path(__file__).resolve().parents[2] / "database" / "schema.sql"
+        schema = schema_path.read_text(encoding="utf-8").casefold()
+
+        self.assertIn("create or replace view active_item as", schema)
+        view = schema.split("create or replace view active_item as", 1)[1].split(";", 1)[0]
+
+        self.assertIn("select i.*", view)
+        self.assertIn("from items i", view)
+        self.assertIn("where exists", view)
+        self.assertIn("from store_items si", view)
+        self.assertIn("si.item_id = i.id", view)
+        self.assertIn("si.is_boardgame = true", view)
+        self.assertIn("si.is_boardgame_confirmed = true", view)
 
     def test_schema_removes_offers_and_keeps_item_relationships(self):
         schema_path = Path(__file__).resolve().parents[2] / "database" / "schema.sql"
@@ -345,6 +363,43 @@ class SchemaTests(unittest.TestCase):
         self.assertIn("primary key (query_id, cache_id)", query_results_table)
         self.assertIn("bgg_search_queries_normalized_query_idx", schema)
         self.assertIn("bgg_search_query_results_query_rank_idx", schema)
+
+    def test_schema_contains_front_page_categories(self):
+        schema_path = Path(__file__).resolve().parents[2] / "database" / "schema.sql"
+        schema = schema_path.read_text(encoding="utf-8").casefold()
+
+        self.assertIn("create table if not exists front_page_categories", schema)
+        table = schema.split("create table if not exists front_page_categories", 1)[1].split(");", 1)[0]
+
+        self.assertIn("id bigserial primary key", table)
+        self.assertIn("category_type text not null", table)
+        self.assertIn("category_type in ('category', 'family', 'mechanic')", table)
+        self.assertIn("category_id bigint not null", table)
+        self.assertIn("title text not null", table)
+        self.assertIn('"order" numeric not null default 0', table)
+        self.assertIn("created_at timestamptz not null default now()", table)
+        self.assertIn("updated_at timestamptz not null default now()", table)
+        self.assertIn('alter table if exists front_page_categories add column if not exists "order" numeric not null default 0', schema)
+        self.assertIn("front_page_categories_category_ref_idx", schema)
+        self.assertIn("on front_page_categories (category_type, category_id)", schema)
+
+    def test_schema_contains_front_page_category_items(self):
+        schema_path = Path(__file__).resolve().parents[2] / "database" / "schema.sql"
+        schema = schema_path.read_text(encoding="utf-8").casefold()
+
+        self.assertIn("create table if not exists front_page_category_items", schema)
+        table = schema.split("create table if not exists front_page_category_items", 1)[1].split(");", 1)[0]
+
+        self.assertIn("id bigserial primary key", table)
+        self.assertIn("front_page_category_id bigint not null references front_page_categories(id) on delete cascade", table)
+        self.assertIn("item_id bigint not null unique references items(id) on delete cascade", table)
+        self.assertIn("item_order integer not null default 0", table)
+        self.assertIn("created_at timestamptz not null default now()", table)
+        self.assertIn("updated_at timestamptz not null default now()", table)
+        self.assertIn("front_page_category_items_item_id_idx", schema)
+        self.assertIn("on front_page_category_items (item_id)", schema)
+        self.assertIn("front_page_category_items_category_order_idx", schema)
+        self.assertIn("on front_page_category_items (front_page_category_id, item_order)", schema)
 
 
 if __name__ == "__main__":

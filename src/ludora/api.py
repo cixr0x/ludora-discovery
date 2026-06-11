@@ -16,6 +16,9 @@ class RunManager(Protocol):
     def start_item_discovery(self, store_id: int, website_url: str):
         ...
 
+    def start_item_update(self):
+        ...
+
     def get_run(self, run_id: str):
         ...
 
@@ -52,6 +55,13 @@ def route_request(
             return 400, {"error": {"message": "website_url is required"}}
         try:
             run = manager.start_item_discovery(store_id, website_url)
+        except OperationAlreadyRunning as exc:
+            return 409, {"error": {"message": str(exc)}}
+        return 202, {"data": run.to_dict()}
+
+    if method == "POST" and path == "/operations/item-update-runs":
+        try:
+            run = manager.start_item_update()
         except OperationAlreadyRunning as exc:
             return 409, {"error": {"message": str(exc)}}
         return 202, {"data": run.to_dict()}

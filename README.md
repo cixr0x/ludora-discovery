@@ -94,11 +94,12 @@ Available endpoints:
 GET  /health
 POST /operations/store-discovery-runs
 POST /operations/stores/{store_id}/item-discovery-runs
+POST /operations/item-update-runs
 GET  /operations/store-discovery-runs/latest
 GET  /operations/store-discovery-runs/{run_id}
 ```
 
-Only one store discovery run can be active at a time. A second start request returns HTTP `409`.
+Only one discovery operation can be active at a time. A second start request returns HTTP `409`.
 
 To also export the old CSV/JSON files for manual inspection:
 

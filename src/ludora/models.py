@@ -6,7 +6,7 @@ from typing import Literal
 
 StoreCandidateStatus = Literal["PENDING", "ACCEPTED", "REJECTED"]
 ItemCandidateType = Literal["unknown", "base_game", "expansion"]
-ItemCandidateStatus = Literal["NEW", "REJECTED", "NOT_BOARDGAME", "LISTED", "UNLISTED", "NEEDS_REVIEW", "MATCH_NOT_FOUND"]
+StoreItemListingStatus = Literal["PENDING", "LISTED", "UNLISTED", "REJECTED"]
 ItemMatchSource = Literal["", "LOCAL", "BGG", "NONE"]
 
 
@@ -149,7 +149,7 @@ class DiscoveryItemCandidateRecord:
     language_source: str = ""
     language_evidence: str = ""
     image_url: str = ""
-    status: ItemCandidateStatus = "NEW"
+    listing_status: StoreItemListingStatus = "PENDING"
     raw_price: str = ""
     price: str = ""
     price_source: str = "none"
@@ -191,7 +191,7 @@ class DiscoveryItemCandidateRecord:
             "language_source": self.language_source,
             "language_evidence": self.language_evidence,
             "image_url": self.image_url,
-            "status": self.status,
+            "listing_status": self.listing_status,
             "raw_price": self.raw_price,
             "price": self.price or None,
             "price_source": self.price_source,

@@ -14,7 +14,13 @@ from ludora.webfetch import fetch_html
 
 
 class ItemCandidateRepository(Protocol):
+    def item_candidate_exists(self, store_id: int | None, source_url: str) -> bool:
+        ...
+
     def upsert_item_candidate(self, record: DiscoveryItemCandidateRecord) -> object | None:
+        ...
+
+    def list_confirmed_boardgame_item_candidates(self, limit: int | None = None) -> list[DiscoveryItemCandidateRecord]:
         ...
 
 
@@ -74,6 +80,9 @@ def crawl_store_product_details(
 
         records: list[DiscoveryItemCandidateRecord] = []
         for listing_candidate in listing_candidates:
+            if repository.item_candidate_exists(listing_candidate.store_id, listing_candidate.source_url):
+                continue
+
             detail_candidate = _fetch_detail_candidate(
                 listing_candidate=listing_candidate,
                 source_listing_url=source_listing_url,
@@ -84,6 +93,36 @@ def crawl_store_product_details(
             if item_processor is not None and getattr(upsert_result, "should_process", False):
                 item_processor.process_candidate(int(getattr(upsert_result, "candidate_id")), detail_candidate)
             records.append(detail_candidate)
+        return records
+    finally:
+        if browser_session is not None:
+            browser_session.__exit__(None, None, None)
+
+
+def update_confirmed_store_item_details(
+    repository: ItemCandidateRepository,
+    limit: int | None = None,
+    browser_fetch_enabled: bool = False,
+    browser_fetcher: Callable[[str], FetchResult | None] | None = None,
+) -> list[DiscoveryItemCandidateRecord]:
+    browser_session = None
+    if browser_fetch_enabled and browser_fetcher is None:
+        from ludora.browser_fetch import BrowserTextFetcher
+
+        browser_session = BrowserTextFetcher()
+        browser_fetcher = browser_session.__enter__().fetch
+
+    try:
+        records: list[DiscoveryItemCandidateRecord] = []
+        for existing_record in repository.list_confirmed_boardgame_item_candidates(limit=limit):
+            refreshed_record = _fetch_detail_candidate(
+                listing_candidate=existing_record,
+                source_listing_url=existing_record.source_listing_url or existing_record.source_url,
+                browser_fetcher=browser_fetcher if browser_fetch_enabled else None,
+            )
+            _preserve_confirmed_item_state(refreshed_record, existing_record)
+            repository.upsert_item_candidate(refreshed_record)
+            records.append(refreshed_record)
         return records
     finally:
         if browser_session is not None:
@@ -131,3 +170,17 @@ def _title_from_url(product_url: str) -> str:
     path = urlparse(product_url).path.rstrip("/")
     slug = path.rsplit("/", 1)[-1]
     return " ".join(part for part in slug.replace("-", " ").split() if part)
+
+
+def _preserve_confirmed_item_state(
+    refreshed_record: DiscoveryItemCandidateRecord,
+    existing_record: DiscoveryItemCandidateRecord,
+) -> None:
+    refreshed_record.store_id = existing_record.store_id
+    refreshed_record.source_url = existing_record.source_url
+    refreshed_record.item_id = existing_record.item_id
+    refreshed_record.listing_status = existing_record.listing_status
+    refreshed_record.is_boardgame = True
+    refreshed_record.is_boardgame_confirmed = True
+    refreshed_record.category_confidence = existing_record.category_confidence
+    refreshed_record.classification_reasons = list(existing_record.classification_reasons)

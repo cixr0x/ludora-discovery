@@ -8,19 +8,16 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Literal
 
-from ludora.bgg import BggClient
+from ludora.admin_matching import AdminItemMatcher
 from ludora.collector import collect_stores
 from ludora.config import (
-    resolve_bgg_api_base_url,
-    resolve_bgg_api_token,
+    resolve_admin_api_url,
     resolve_brave_api_key,
     resolve_browser_fetch_enabled,
     resolve_database_url,
 )
 from ludora.database import DiscoveryRepository, connect_database
-from ludora.inventory import collect_store_inventory
-from ludora.item_import import BggItemImporter
-from ludora.item_processing import ItemCandidateProcessor
+from ludora.inventory import collect_store_inventory, update_confirmed_store_items
 
 
 RunStatus = Literal["running", "completed", "failed"]
@@ -58,6 +55,16 @@ class ItemDiscoveryRunResult:
         }
 
 
+@dataclass(frozen=True)
+class ItemUpdateRunResult:
+    updated_items: int
+
+    def to_dict(self) -> dict[str, int]:
+        return {
+            "updated_items": self.updated_items,
+        }
+
+
 @dataclass
 class StoreDiscoveryRun:
     id: str
@@ -65,7 +72,7 @@ class StoreDiscoveryRun:
     started_at: datetime
     run_type: str = "store_discovery"
     completed_at: datetime | None = None
-    result: StoreDiscoveryRunResult | ItemDiscoveryRunResult | None = None
+    result: StoreDiscoveryRunResult | ItemDiscoveryRunResult | ItemUpdateRunResult | None = None
     error: str | None = None
 
     def to_dict(self) -> dict[str, object]:
@@ -132,15 +139,12 @@ def run_item_discovery(
     if not database_url:
         raise RuntimeError("Missing database URL")
     browser_sitemap_fetch_enabled = resolve_browser_fetch_enabled(env=current_env, dotenv_path=env_file)
-    bgg_api_token = resolve_bgg_api_token(None, env=current_env, dotenv_path=env_file)
-    bgg_api_base_url = resolve_bgg_api_base_url(env=current_env, dotenv_path=env_file)
+    admin_api_url = resolve_admin_api_url(env=current_env, dotenv_path=env_file)
 
     connection = connect_database(database_url)
     try:
         repository = DiscoveryRepository(connection)
-        bgg_client = BggClient(api_token=bgg_api_token, base_url=bgg_api_base_url) if bgg_api_token else None
-        bgg_importer = BggItemImporter(connection, bgg_client=bgg_client) if bgg_client else None
-        item_processor = ItemCandidateProcessor(repository, bgg_client=bgg_client, bgg_importer=bgg_importer)
+        item_processor = AdminItemMatcher(admin_api_url, repository)
         records = collect_store_inventory(
             website_url,
             store_id,
@@ -157,11 +161,35 @@ def run_item_discovery(
         connection.close()
 
 
+def run_item_update(
+    *,
+    env: Mapping[str, str] | None = None,
+    env_file: str = ".env",
+) -> ItemUpdateRunResult:
+    current_env = env if env is not None else os.environ
+    database_url = resolve_database_url(None, env=current_env, dotenv_path=env_file)
+    if not database_url:
+        raise RuntimeError("Missing database URL")
+    browser_fetch_enabled = resolve_browser_fetch_enabled(env=current_env, dotenv_path=env_file)
+
+    connection = connect_database(database_url)
+    try:
+        repository = DiscoveryRepository(connection)
+        records = update_confirmed_store_items(
+            repository,
+            browser_fetch_enabled=browser_fetch_enabled,
+        )
+        return ItemUpdateRunResult(updated_items=len(records))
+    finally:
+        connection.close()
+
+
 class StoreDiscoveryRunManager:
     def __init__(
         self,
         runner: Callable[[], StoreDiscoveryRunResult] | None = None,
         item_runner: Callable[[int, str], ItemDiscoveryRunResult] | None = None,
+        item_update_runner: Callable[[], ItemUpdateRunResult] | None = None,
         *,
         background: bool = True,
         env_file: str = ".env",
@@ -174,6 +202,7 @@ class StoreDiscoveryRunManager:
                 env_file=env_file,
             )
         )
+        self.item_update_runner = item_update_runner or (lambda: run_item_update(env_file=env_file))
         self.background = background
         self.lock = threading.Lock()
         self.runs: dict[str, StoreDiscoveryRun] = {}
@@ -225,6 +254,29 @@ class StoreDiscoveryRunManager:
 
         return self.get_run(run.id) or run
 
+    def start_item_update(self) -> StoreDiscoveryRun:
+        with self.lock:
+            if self.active_run_id and self.runs[self.active_run_id].status == "running":
+                raise OperationAlreadyRunning("Discovery operation is already running")
+
+            run = StoreDiscoveryRun(
+                id=str(uuid.uuid4()),
+                status="running",
+                started_at=_utc_now(),
+                run_type="item_update",
+            )
+            self.runs[run.id] = run
+            self.latest_run_id = run.id
+            self.active_run_id = run.id
+
+        if self.background:
+            thread = threading.Thread(target=self._execute_item_update_run, args=(run.id,), daemon=True)
+            thread.start()
+        else:
+            self._execute_item_update_run(run.id)
+
+        return self.get_run(run.id) or run
+
     def get_run(self, run_id: str) -> StoreDiscoveryRun | None:
         with self.lock:
             return self.runs.get(run_id)
@@ -257,6 +309,25 @@ class StoreDiscoveryRunManager:
     def _execute_item_run(self, run_id: str, store_id: int, website_url: str) -> None:
         try:
             result = self.item_runner(store_id, website_url)
+        except Exception as exc:  # pragma: no cover - message behavior is tested through manager.
+            with self.lock:
+                run = self.runs[run_id]
+                run.status = "failed"
+                run.error = str(exc)
+                run.completed_at = _utc_now()
+                self.active_run_id = None
+            return
+
+        with self.lock:
+            run = self.runs[run_id]
+            run.status = "completed"
+            run.result = result
+            run.completed_at = _utc_now()
+            self.active_run_id = None
+
+    def _execute_item_update_run(self, run_id: str) -> None:
+        try:
+            result = self.item_update_runner()
         except Exception as exc:  # pragma: no cover - message behavior is tested through manager.
             with self.lock:
                 run = self.runs[run_id]

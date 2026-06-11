@@ -9,6 +9,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from ludora.config import (
     load_dotenv_values,
+    resolve_admin_api_url,
     resolve_bgg_api_base_url,
     resolve_bgg_api_token,
     resolve_brave_api_key,
@@ -103,6 +104,18 @@ class ConfigTests(unittest.TestCase):
     def test_resolve_browser_fetch_enabled_is_false_when_missing(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             self.assertFalse(resolve_browser_fetch_enabled(env={}, dotenv_path=Path(temp_dir) / ".env"))
+
+    def test_resolve_admin_api_url_prefers_environment_then_dotenv_then_local_default(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            dotenv_path = Path(temp_dir) / ".env"
+            dotenv_path.write_text("LUDORA_ADMIN_API_URL=http://admin-dotenv.test\n", encoding="utf-8")
+
+            self.assertEqual(
+                resolve_admin_api_url(env={"LUDORA_ADMIN_API_URL": "http://admin-env.test"}, dotenv_path=dotenv_path),
+                "http://admin-env.test",
+            )
+            self.assertEqual(resolve_admin_api_url(env={}, dotenv_path=dotenv_path), "http://admin-dotenv.test")
+            self.assertEqual(resolve_admin_api_url(env={}, dotenv_path=Path(temp_dir) / "missing.env"), "http://127.0.0.1:4001")
 
     def test_resolve_bgg_api_token_prefers_cli_then_environment_then_dotenv(self):
         with tempfile.TemporaryDirectory() as temp_dir:
