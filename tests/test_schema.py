@@ -283,6 +283,38 @@ class SchemaTests(unittest.TestCase):
         )
         self.assertIn("translation_jobs_source_idx", schema)
 
+    def test_schema_contains_item_search_embeddings(self):
+        schema_path = Path(__file__).resolve().parents[2] / "database" / "schema.sql"
+        schema = schema_path.read_text(encoding="utf-8").casefold()
+
+        self.assertIn("create extension if not exists vector", schema)
+        self.assertIn("create table if not exists item_search_embeddings", schema)
+
+        table = schema.split("create table if not exists item_search_embeddings", 1)[1].split(");", 1)[0]
+
+        for column_name in [
+            "item_id",
+            "embedding",
+            "source_text",
+            "source_hash",
+            "model",
+            "embedding_dimensions",
+            "created_at",
+            "updated_at",
+        ]:
+            self.assertIn(column_name, table)
+
+        self.assertIn("item_id bigint primary key references items(id) on delete cascade", table)
+        self.assertIn("embedding vector(1536) not null", table)
+        self.assertIn("source_text text not null", table)
+        self.assertIn("source_hash text not null", table)
+        self.assertIn("model text not null", table)
+        self.assertIn("embedding_dimensions integer not null default 1536", table)
+        self.assertIn("item_search_embeddings_source_hash_idx", schema)
+        self.assertIn("on item_search_embeddings (source_hash)", schema)
+        self.assertIn("item_search_embeddings_model_idx", schema)
+        self.assertIn("on item_search_embeddings (model)", schema)
+
     def test_schema_contains_bgg_metadata_tables(self):
         schema_path = Path(__file__).resolve().parents[2] / "database" / "schema.sql"
         schema = schema_path.read_text(encoding="utf-8").casefold()

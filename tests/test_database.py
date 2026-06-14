@@ -6,7 +6,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from ludora.database import DiscoveryRepository
+from ludora.database import DiscoveryRepository, ItemSearchEmbeddingSource
 from ludora.models import DiscoveryItemCandidateRecord, StoreRecord
 
 
@@ -342,6 +342,88 @@ class DatabaseRepositoryTests(unittest.TestCase):
         self.assertIn("processing_error = %s", error_sql.casefold())
         self.assertEqual(error_params, ("BGG client is not configured", 58))
         self.assertEqual(connection.commits, 3)
+
+    def test_lists_item_search_embedding_sources_with_taxonomy(self):
+        connection = FakeConnection(
+            fetchall_rows=[
+                [
+                    (
+                        77,
+                        "Calico",
+                        "Calico",
+                        "A puzzly tile-laying game about sewing quilts and attracting cats.",
+                        "Un juego sobre coser colchas y atraer gatos.",
+                        ["Animals", "Puzzle"],
+                        ["Pattern Building", "Tile Placement"],
+                        ["Cats"],
+                    )
+                ]
+            ]
+        )
+        repository = DiscoveryRepository(connection)
+
+        sources = repository.list_item_search_embedding_sources(refresh_mode="missing")
+
+        sql, params = connection.cursor_instance.executions[0]
+        normalized_sql = sql.casefold()
+        self.assertIn("from items i", normalized_sql)
+        self.assertIn("left join item_search_embeddings ise", normalized_sql)
+        self.assertIn("where ise.item_id is null", normalized_sql)
+        self.assertIn("from item_categories", normalized_sql)
+        self.assertIn("from item_mechanics", normalized_sql)
+        self.assertIn("from item_families", normalized_sql)
+        self.assertEqual(params, ())
+        self.assertEqual(
+            sources,
+            [
+                ItemSearchEmbeddingSource(
+                    item_id=77,
+                    canonical_name="Calico",
+                    canonical_name_es="Calico",
+                    description="A puzzly tile-laying game about sewing quilts and attracting cats.",
+                    description_es="Un juego sobre coser colchas y atraer gatos.",
+                    categories=["Animals", "Puzzle"],
+                    mechanics=["Pattern Building", "Tile Placement"],
+                    families=["Cats"],
+                )
+            ],
+        )
+
+    def test_full_item_search_embedding_source_refresh_includes_all_items(self):
+        connection = FakeConnection(fetchall_rows=[[]])
+        repository = DiscoveryRepository(connection)
+
+        repository.list_item_search_embedding_sources(refresh_mode="full")
+
+        sql, params = connection.cursor_instance.executions[0]
+        self.assertIn("from items i", sql.casefold())
+        self.assertNotIn("where ise.item_id is null", sql.casefold())
+        self.assertEqual(params, ())
+
+    def test_upserts_item_search_embedding(self):
+        connection = FakeConnection()
+        repository = DiscoveryRepository(connection)
+
+        repository.upsert_item_search_embedding(
+            item_id=77,
+            embedding=[0.1, -0.2, 0.3],
+            source_text="Name: Calico",
+            source_hash="source-hash",
+            model="text-embedding-3-small",
+        )
+
+        sql, params = connection.cursor_instance.executions[0]
+        normalized_sql = sql.casefold()
+        self.assertIn("insert into item_search_embeddings", normalized_sql)
+        self.assertIn("on conflict (item_id) do update", normalized_sql)
+        self.assertIn("%s::vector", normalized_sql)
+        self.assertEqual(params[0], 77)
+        self.assertEqual(params[1], "[0.1,-0.2,0.3]")
+        self.assertEqual(params[2], "Name: Calico")
+        self.assertEqual(params[3], "source-hash")
+        self.assertEqual(params[4], "text-embedding-3-small")
+        self.assertEqual(params[5], 3)
+        self.assertEqual(connection.commits, 1)
 
 
 if __name__ == "__main__":

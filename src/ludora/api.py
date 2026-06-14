@@ -19,6 +19,9 @@ class RunManager(Protocol):
     def start_item_update(self):
         ...
 
+    def start_item_embeddings(self, refresh_mode: str):
+        ...
+
     def get_run(self, run_id: str):
         ...
 
@@ -62,6 +65,16 @@ def route_request(
     if method == "POST" and path == "/operations/item-update-runs":
         try:
             run = manager.start_item_update()
+        except OperationAlreadyRunning as exc:
+            return 409, {"error": {"message": str(exc)}}
+        return 202, {"data": run.to_dict()}
+
+    if method == "POST" and path == "/operations/item-embedding-runs":
+        refresh_mode = str((body or {}).get("refresh_mode", "missing")).strip().lower() or "missing"
+        if refresh_mode not in {"missing", "full"}:
+            return 400, {"error": {"message": "refresh_mode must be missing or full"}}
+        try:
+            run = manager.start_item_embeddings(refresh_mode)
         except OperationAlreadyRunning as exc:
             return 409, {"error": {"message": str(exc)}}
         return 202, {"data": run.to_dict()}

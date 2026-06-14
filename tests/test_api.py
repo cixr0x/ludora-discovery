@@ -7,6 +7,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from ludora.api import route_request
 from ludora.operations import (
+    ItemEmbeddingRunResult,
     ItemDiscoveryRunResult,
     ItemUpdateRunResult,
     OperationAlreadyRunning,
@@ -91,6 +92,49 @@ class DiscoveryApiTests(unittest.TestCase):
         self.assertEqual(payload["data"]["type"], "item_update")
         self.assertEqual(payload["data"]["status"], "completed")
         self.assertEqual(payload["data"]["result"]["updated_items"], 8)
+
+    def test_starts_item_embedding_run(self):
+        manager = StoreDiscoveryRunManager(
+            runner=lambda: StoreDiscoveryRunResult(0, 0, 0),
+            item_embedding_runner=lambda refresh_mode: ItemEmbeddingRunResult(
+                refresh_mode=refresh_mode,
+                selected_items=4,
+                embedded_items=4,
+                model="text-embedding-3-small",
+            ),
+            background=False,
+        )
+
+        status, payload = route_request(
+            "POST",
+            "/operations/item-embedding-runs",
+            manager,
+            {"refresh_mode": "full"},
+        )
+
+        self.assertEqual(status, 202)
+        self.assertEqual(payload["data"]["type"], "item_embeddings")
+        self.assertEqual(payload["data"]["status"], "completed")
+        self.assertEqual(payload["data"]["result"]["refresh_mode"], "full")
+        self.assertEqual(payload["data"]["result"]["selected_items"], 4)
+        self.assertEqual(payload["data"]["result"]["embedded_items"], 4)
+        self.assertEqual(payload["data"]["result"]["model"], "text-embedding-3-small")
+
+    def test_item_embedding_run_rejects_invalid_refresh_mode(self):
+        manager = StoreDiscoveryRunManager(
+            runner=lambda: StoreDiscoveryRunResult(0, 0, 0),
+            background=False,
+        )
+
+        status, payload = route_request(
+            "POST",
+            "/operations/item-embedding-runs",
+            manager,
+            {"refresh_mode": "everything"},
+        )
+
+        self.assertEqual(status, 400)
+        self.assertEqual(payload, {"error": {"message": "refresh_mode must be missing or full"}})
 
     def test_item_discovery_requires_valid_store_and_website_url(self):
         manager = StoreDiscoveryRunManager(

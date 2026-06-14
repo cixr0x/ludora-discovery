@@ -21,6 +21,18 @@ class ItemCandidateUpsertResult:
     should_process: bool
 
 
+@dataclass(frozen=True)
+class ItemSearchEmbeddingSource:
+    item_id: int
+    canonical_name: str
+    canonical_name_es: str
+    description: str
+    description_es: str
+    categories: list[str]
+    mechanics: list[str]
+    families: list[str]
+
+
 class DiscoveryRepository:
     def __init__(self, connection: Any):
         self.connection = connection
@@ -156,6 +168,95 @@ class DiscoveryRepository:
         with self.connection.cursor() as cursor:
             cursor.execute(sql, params)
             return [_item_candidate_from_row(row) for row in cursor.fetchall()]
+
+    def list_item_search_embedding_sources(self, *, refresh_mode: str = "missing") -> list[ItemSearchEmbeddingSource]:
+        where_sql = "where ise.item_id is null" if refresh_mode == "missing" else ""
+        sql = f"""
+            select
+              i.id,
+              i.canonical_name,
+              i.canonical_name_es,
+              i.description,
+              i.description_es,
+              coalesce(categories.names, '{{}}'::text[]) as categories,
+              coalesce(mechanics.names, '{{}}'::text[]) as mechanics,
+              coalesce(families.names, '{{}}'::text[]) as families
+            from items i
+            left join item_search_embeddings ise on ise.item_id = i.id
+            left join lateral (
+              select array_agg(bc.name order by bc.name) as names
+              from item_categories ic
+              join boardgame_categories bc on bc.id = ic.category_id
+              where ic.item_id = i.id
+            ) categories on true
+            left join lateral (
+              select array_agg(bm.name order by bm.name) as names
+              from item_mechanics im
+              join boardgame_mechanics bm on bm.id = im.mechanic_id
+              where im.item_id = i.id
+            ) mechanics on true
+            left join lateral (
+              select array_agg(bf.name order by bf.name) as names
+              from item_families ifa
+              join boardgame_families bf on bf.id = ifa.family_id
+              where ifa.item_id = i.id
+            ) families on true
+            {where_sql}
+            order by i.id asc
+        """
+
+        with self.connection.cursor() as cursor:
+            cursor.execute(sql, ())
+            return [
+                ItemSearchEmbeddingSource(
+                    item_id=int(row[0]),
+                    canonical_name=_text(row[1]),
+                    canonical_name_es=_text(row[2]),
+                    description=_text(row[3]),
+                    description_es=_text(row[4]),
+                    categories=_string_list(row[5]),
+                    mechanics=_string_list(row[6]),
+                    families=_string_list(row[7]),
+                )
+                for row in cursor.fetchall()
+            ]
+
+    def upsert_item_search_embedding(
+        self,
+        *,
+        item_id: int,
+        embedding: list[float],
+        source_text: str,
+        source_hash: str,
+        model: str,
+    ) -> None:
+        embedding_dimensions = len(embedding)
+        embedding_literal = _vector_literal(embedding)
+        with self.connection.cursor() as cursor:
+            cursor.execute(
+                """
+                insert into item_search_embeddings (
+                    item_id,
+                    embedding,
+                    source_text,
+                    source_hash,
+                    model,
+                    embedding_dimensions,
+                    created_at,
+                    updated_at
+                )
+                values (%s, %s::vector, %s, %s, %s, %s, now(), now())
+                on conflict (item_id) do update set
+                    embedding = excluded.embedding,
+                    source_text = excluded.source_text,
+                    source_hash = excluded.source_hash,
+                    model = excluded.model,
+                    embedding_dimensions = excluded.embedding_dimensions,
+                    updated_at = now()
+                """,
+                (item_id, embedding_literal, source_text, source_hash, model, embedding_dimensions),
+            )
+        self.connection.commit()
 
     def _item_candidate_write_params(self, data: dict[str, object]) -> tuple[object, ...]:
         return (
@@ -413,6 +514,16 @@ def _text(value: object) -> str:
     if value is None:
         return ""
     return str(value)
+
+
+def _string_list(value: object) -> list[str]:
+    if not isinstance(value, (list, tuple)):
+        return []
+    return [item for item in (_text(entry).strip() for entry in value) if item]
+
+
+def _vector_literal(values: list[float]) -> str:
+    return "[" + ",".join(str(value) for value in values) + "]"
 
 
 def _json_object(value: object) -> dict[str, object]:

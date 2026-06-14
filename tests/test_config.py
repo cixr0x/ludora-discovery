@@ -15,6 +15,8 @@ from ludora.config import (
     resolve_brave_api_key,
     resolve_browser_fetch_enabled,
     resolve_database_url,
+    resolve_embedding_model,
+    resolve_openai_api_key,
 )
 
 
@@ -135,6 +137,23 @@ class ConfigTests(unittest.TestCase):
                 resolve_bgg_api_base_url(env={}, dotenv_path=Path(temp_dir) / ".env"),
                 "https://boardgamegeek.com/xmlapi2",
             )
+
+    def test_resolves_openai_key_and_embedding_model(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            dotenv_path = Path(temp_dir) / ".env"
+            dotenv_path.write_text(
+                "OPENAI_API_KEY=from_dotenv\nOPENAI_EMBEDDING_MODEL=text-embedding-3-small\n",
+                encoding="utf-8",
+            )
+
+            self.assertEqual(resolve_openai_api_key(env={"OPENAI_API_KEY": "from_env"}, dotenv_path=dotenv_path), "from_env")
+            self.assertEqual(resolve_openai_api_key(env={}, dotenv_path=dotenv_path), "from_dotenv")
+            self.assertEqual(
+                resolve_embedding_model(env={"OPENAI_EMBEDDING_MODEL": "embedding-env"}, dotenv_path=dotenv_path),
+                "embedding-env",
+            )
+            self.assertEqual(resolve_embedding_model(env={}, dotenv_path=dotenv_path), "text-embedding-3-small")
+            self.assertEqual(resolve_embedding_model(env={}, dotenv_path=Path(temp_dir) / "missing.env"), "text-embedding-3-small")
 
 
 if __name__ == "__main__":

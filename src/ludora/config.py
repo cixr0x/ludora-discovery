@@ -60,6 +60,31 @@ def resolve_database_url(
     return load_dotenv_values(dotenv_path).get("LUDORA_DATABASE_URL", "").strip()
 
 
+def resolve_openai_api_key(
+    env: Mapping[str, str] | None = None,
+    dotenv_path: str | Path = ".env",
+) -> str:
+    current_env = env if env is not None else os.environ
+    env_value = current_env.get("OPENAI_API_KEY", "").strip()
+    if env_value:
+        return env_value
+
+    return load_dotenv_values(dotenv_path).get("OPENAI_API_KEY", "").strip()
+
+
+def resolve_embedding_model(
+    env: Mapping[str, str] | None = None,
+    dotenv_path: str | Path = ".env",
+) -> str:
+    current_env = env if env is not None else os.environ
+    env_value = current_env.get("OPENAI_EMBEDDING_MODEL", "").strip()
+    if env_value:
+        return env_value
+
+    dotenv_value = load_dotenv_values(dotenv_path).get("OPENAI_EMBEDDING_MODEL", "").strip()
+    return dotenv_value or "text-embedding-3-small"
+
+
 def resolve_bgg_api_token(
     cli_value: str | None,
     env: Mapping[str, str] | None = None,

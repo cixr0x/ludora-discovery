@@ -15,12 +15,16 @@ from ludora.config import (
     resolve_brave_api_key,
     resolve_browser_fetch_enabled,
     resolve_database_url,
+    resolve_embedding_model,
+    resolve_openai_api_key,
 )
 from ludora.database import DiscoveryRepository, connect_database
+from ludora.embeddings import OpenAIEmbeddingClient, build_item_embedding_text, source_text_hash
 from ludora.inventory import collect_store_inventory, update_confirmed_store_items
 
 
 RunStatus = Literal["running", "completed", "failed"]
+EmbeddingRefreshMode = Literal["missing", "full"]
 
 
 class OperationAlreadyRunning(RuntimeError):
@@ -65,6 +69,22 @@ class ItemUpdateRunResult:
         }
 
 
+@dataclass(frozen=True)
+class ItemEmbeddingRunResult:
+    refresh_mode: str
+    selected_items: int
+    embedded_items: int
+    model: str
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "refresh_mode": self.refresh_mode,
+            "selected_items": self.selected_items,
+            "embedded_items": self.embedded_items,
+            "model": self.model,
+        }
+
+
 @dataclass
 class StoreDiscoveryRun:
     id: str
@@ -72,7 +92,7 @@ class StoreDiscoveryRun:
     started_at: datetime
     run_type: str = "store_discovery"
     completed_at: datetime | None = None
-    result: StoreDiscoveryRunResult | ItemDiscoveryRunResult | ItemUpdateRunResult | None = None
+    result: StoreDiscoveryRunResult | ItemDiscoveryRunResult | ItemUpdateRunResult | ItemEmbeddingRunResult | None = None
     error: str | None = None
 
     def to_dict(self) -> dict[str, object]:
@@ -184,12 +204,56 @@ def run_item_update(
         connection.close()
 
 
+def run_item_embeddings(
+    *,
+    refresh_mode: EmbeddingRefreshMode = "missing",
+    env: Mapping[str, str] | None = None,
+    env_file: str = ".env",
+) -> ItemEmbeddingRunResult:
+    current_env = env if env is not None else os.environ
+    database_url = resolve_database_url(None, env=current_env, dotenv_path=env_file)
+    if not database_url:
+        raise RuntimeError("Missing database URL")
+    openai_api_key = resolve_openai_api_key(env=current_env, dotenv_path=env_file)
+    if not openai_api_key:
+        raise RuntimeError("Missing OpenAI API key")
+    embedding_model = resolve_embedding_model(env=current_env, dotenv_path=env_file)
+
+    connection = connect_database(database_url)
+    try:
+        repository = DiscoveryRepository(connection)
+        client = OpenAIEmbeddingClient(api_key=openai_api_key, model=embedding_model)
+        sources = repository.list_item_search_embedding_sources(refresh_mode=refresh_mode)
+        embedded_items = 0
+        for source in sources:
+            source_text = build_item_embedding_text(source)
+            embedding = client.create_embedding(source_text)
+            repository.upsert_item_search_embedding(
+                item_id=source.item_id,
+                embedding=embedding,
+                source_text=source_text,
+                source_hash=source_text_hash(source_text),
+                model=embedding_model,
+            )
+            embedded_items += 1
+
+        return ItemEmbeddingRunResult(
+            refresh_mode=refresh_mode,
+            selected_items=len(sources),
+            embedded_items=embedded_items,
+            model=embedding_model,
+        )
+    finally:
+        connection.close()
+
+
 class StoreDiscoveryRunManager:
     def __init__(
         self,
         runner: Callable[[], StoreDiscoveryRunResult] | None = None,
         item_runner: Callable[[int, str], ItemDiscoveryRunResult] | None = None,
         item_update_runner: Callable[[], ItemUpdateRunResult] | None = None,
+        item_embedding_runner: Callable[[EmbeddingRefreshMode], ItemEmbeddingRunResult] | None = None,
         *,
         background: bool = True,
         env_file: str = ".env",
@@ -203,6 +267,9 @@ class StoreDiscoveryRunManager:
             )
         )
         self.item_update_runner = item_update_runner or (lambda: run_item_update(env_file=env_file))
+        self.item_embedding_runner = item_embedding_runner or (
+            lambda refresh_mode: run_item_embeddings(refresh_mode=refresh_mode, env_file=env_file)
+        )
         self.background = background
         self.lock = threading.Lock()
         self.runs: dict[str, StoreDiscoveryRun] = {}
@@ -277,6 +344,29 @@ class StoreDiscoveryRunManager:
 
         return self.get_run(run.id) or run
 
+    def start_item_embeddings(self, refresh_mode: EmbeddingRefreshMode) -> StoreDiscoveryRun:
+        with self.lock:
+            if self.active_run_id and self.runs[self.active_run_id].status == "running":
+                raise OperationAlreadyRunning("Discovery operation is already running")
+
+            run = StoreDiscoveryRun(
+                id=str(uuid.uuid4()),
+                status="running",
+                started_at=_utc_now(),
+                run_type="item_embeddings",
+            )
+            self.runs[run.id] = run
+            self.latest_run_id = run.id
+            self.active_run_id = run.id
+
+        if self.background:
+            thread = threading.Thread(target=self._execute_item_embedding_run, args=(run.id, refresh_mode), daemon=True)
+            thread.start()
+        else:
+            self._execute_item_embedding_run(run.id, refresh_mode)
+
+        return self.get_run(run.id) or run
+
     def get_run(self, run_id: str) -> StoreDiscoveryRun | None:
         with self.lock:
             return self.runs.get(run_id)
@@ -328,6 +418,25 @@ class StoreDiscoveryRunManager:
     def _execute_item_update_run(self, run_id: str) -> None:
         try:
             result = self.item_update_runner()
+        except Exception as exc:  # pragma: no cover - message behavior is tested through manager.
+            with self.lock:
+                run = self.runs[run_id]
+                run.status = "failed"
+                run.error = str(exc)
+                run.completed_at = _utc_now()
+                self.active_run_id = None
+            return
+
+        with self.lock:
+            run = self.runs[run_id]
+            run.status = "completed"
+            run.result = result
+            run.completed_at = _utc_now()
+            self.active_run_id = None
+
+    def _execute_item_embedding_run(self, run_id: str, refresh_mode: EmbeddingRefreshMode) -> None:
+        try:
+            result = self.item_embedding_runner(refresh_mode)
         except Exception as exc:  # pragma: no cover - message behavior is tested through manager.
             with self.lock:
                 run = self.runs[run_id]
