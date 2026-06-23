@@ -50,7 +50,9 @@ def discover_product_urls_from_sitemaps(
     )
     if fetched_root is not None:
         product_urls.extend(_product_urls_from_text(fetched_root.text, fetched_root.url, store_url))
-        sitemap_urls.extend(_product_sitemap_urls_from_text(fetched_root.text, fetched_root.url))
+        sitemap_urls.extend(_product_sitemap_urls_from_text(fetched_root.text, fetched_root.url, store_url))
+        if not sitemap_urls:
+            sitemap_urls.extend(_sitemap_urls_from_text(fetched_root.text, fetched_root.url, store_url))
 
     sitemap_urls = _dedupe([*sitemap_urls, *_direct_product_sitemap_urls(store_url)])
     for sitemap_url in sitemap_urls:
@@ -66,6 +68,9 @@ def discover_product_urls_from_sitemaps(
         if fetched_sitemap is None:
             continue
         product_urls.extend(_product_urls_from_text(fetched_sitemap.text, fetched_sitemap.url, store_url))
+        for nested_sitemap_url in _sitemap_urls_from_text(fetched_sitemap.text, fetched_sitemap.url, store_url):
+            if nested_sitemap_url not in sitemap_urls:
+                sitemap_urls.append(nested_sitemap_url)
 
     deduped_urls = _dedupe(product_urls)
     if not deduped_urls and blocked_urls:
@@ -126,13 +131,32 @@ def _fetch_sitemap(
     return browser_fetched
 
 
-def _product_sitemap_urls_from_text(text: str, base_url: str) -> list[str]:
+def _product_sitemap_urls_from_text(text: str, base_url: str, store_url: str) -> list[str]:
+    return _sitemap_urls_from_text(text, base_url, store_url, product_only=True)
+
+
+def _sitemap_urls_from_text(
+    text: str,
+    base_url: str,
+    store_url: str,
+    *,
+    product_only: bool = False,
+) -> list[str]:
+    if "<sitemap" not in text.casefold():
+        return []
+
+    store_domain = canonical_domain(store_url)
     urls: list[str] = []
     for loc in _loc_values(text):
         sitemap_url = urljoin(base_url, loc)
         normalized = sitemap_url.casefold()
-        if "sitemap" in normalized and "product" in normalized:
-            urls.append(sitemap_url)
+        if canonical_domain(sitemap_url) != store_domain:
+            continue
+        if "sitemap" not in normalized:
+            continue
+        if product_only and "product" not in normalized:
+            continue
+        urls.append(sitemap_url)
     return _dedupe(urls)
 
 

@@ -165,6 +165,99 @@ class InventoryTests(unittest.TestCase):
         self.assertEqual(records[0].title, "Exploding Kittens")
         self.assertEqual(records[0].price, "499.00")
 
+    def test_crawl_store_product_details_uses_browser_when_static_detail_does_not_match_listing(self):
+        static_html = """
+        <html>
+          <head>
+            <title>7-Die Set Opaque Light Blue/white Chessex 25416</title>
+            <meta name="description" content="Los dados opacos Chessex.">
+          </head>
+          <body>
+            <h1>This website uses cookies.</h1>
+          </body>
+        </html>
+        """
+        rendered_html = """
+        <html>
+          <body>
+            <h1>Catan</h1>
+            <p>$850.00 MXN</p>
+            <p>Almost Gone!</p>
+            <p>Idioma: Espanol</p>
+            <p>Jugadores: 3-4</p>
+            <p>Duracion: 75 minutos</p>
+            <p>Edad: 10+</p>
+            <p>Editorial: Devir / Kosmos</p>
+            <p>Un juego de mesa de comercio y desarrollo.</p>
+          </body>
+        </html>
+        """
+        product_url = "https://example.mx/tienda/ols/products/catan"
+        repository = FakeRepository()
+        browser_fetched_urls = []
+
+        def fake_browser_fetcher(url):
+            browser_fetched_urls.append(url)
+            return FetchResult(url=url, text=rendered_html)
+
+        with patch(
+            "ludora.product_crawler.discover_product_urls_from_sitemaps",
+            return_value=[product_url],
+        ), patch(
+            "ludora.product_crawler.fetch_html",
+            return_value=FetchResult(url=product_url, text=static_html),
+        ):
+            records = crawl_store_product_details(
+                "https://example.mx/",
+                12,
+                repository,
+                browser_fetch_enabled=True,
+                browser_fetcher=fake_browser_fetcher,
+            )
+
+        self.assertEqual(browser_fetched_urls, [product_url])
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0].title, "Catan")
+        self.assertEqual(records[0].price, "850.00")
+        self.assertEqual(records[0].min_players, 3)
+        self.assertEqual(records[0].max_players, 4)
+        self.assertTrue(records[0].is_boardgame)
+
+    def test_crawl_store_product_details_keeps_listing_title_when_browser_detail_is_cookie_only(self):
+        cookie_html = """
+        <html>
+          <head>
+            <title>7-Die Set Opaque Light Blue/white Chessex 25416</title>
+            <meta name="description" content="Los dados opacos Chessex.">
+          </head>
+          <body>
+            <h1>This website uses cookies.</h1>
+          </body>
+        </html>
+        """
+        product_url = "https://example.mx/tienda/ols/products/the-resistance-avalon"
+        repository = FakeRepository()
+
+        with patch(
+            "ludora.product_crawler.discover_product_urls_from_sitemaps",
+            return_value=[product_url],
+        ), patch(
+            "ludora.product_crawler.fetch_html",
+            return_value=FetchResult(url=product_url, text=cookie_html),
+        ):
+            records = crawl_store_product_details(
+                "https://example.mx/",
+                12,
+                repository,
+                browser_fetch_enabled=True,
+                browser_fetcher=lambda url: FetchResult(url=url, text=cookie_html),
+            )
+
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0].title, "the resistance avalon")
+        self.assertNotEqual(records[0].title, "This website uses cookies.")
+        self.assertEqual(repository.item_records[0].title, "the resistance avalon")
+
     def test_crawl_store_product_details_processes_new_candidates_after_upsert(self):
         detail_html = """
         <script type="application/ld+json">

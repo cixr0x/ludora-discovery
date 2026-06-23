@@ -49,6 +49,36 @@ PRODUCT_IMAGE_CONTAINER_CLASSES = {
 PRODUCT_IMAGE_CLASSES = {
     "wp-post-image",
 }
+VISIBLE_DESCRIPTION_STOP_PREFIXES = (
+    "copyright",
+    "aviso de privacidad",
+    "powered by",
+    "this website uses cookies",
+    "we use cookies",
+    "you may also like",
+    "related products",
+    "productos relacionados",
+)
+VISIBLE_DESCRIPTION_NOISE = {
+    "add to cart",
+    "agregar al carrito",
+    "almost gone",
+    "all products",
+    "inicio",
+    "more",
+    "quantity",
+    "tienda",
+}
+VISIBLE_DESCRIPTION_FACT_PREFIXES = (
+    "duracion",
+    "edad",
+    "editorial",
+    "idioma",
+    "jugadores",
+    "language",
+    "players",
+    "publisher",
+)
 
 
 @dataclass(frozen=True)
@@ -72,6 +102,7 @@ class ProductDetailParser(HTMLParser):
         self.woocommerce_price_texts: list[str] = []
         self.woocommerce_stock_blocks: list[tuple[str, str]] = []
         self.product_image_urls: list[str] = []
+        self.image_candidates: list[tuple[str, str]] = []
         self._ignored_text_depth = 0
         self._inside_script = False
         self._current_script_type = ""
@@ -120,8 +151,12 @@ class ProductDetailParser(HTMLParser):
             href = attr.get("href", "").strip()
             if _looks_like_image_url(href):
                 self._append_product_image_url(href)
-        if normalized_tag == "img" and (self._product_image_depth or _is_product_image_tag(class_value, attr)):
-            self._append_product_image_url(_image_url_from_attrs(attr))
+        if normalized_tag == "img":
+            image_url = _image_url_from_attrs(attr)
+            alt_text = attr.get("alt", "").strip()
+            self._append_image_candidate(alt_text, image_url)
+            if self._product_image_depth or _is_product_image_tag(class_value, attr):
+                self._append_product_image_url(image_url)
         if normalized_tag == "script":
             self._inside_script = True
             self._current_script_type = attr.get("type", "").casefold()
@@ -190,6 +225,11 @@ class ProductDetailParser(HTMLParser):
         if image_url and image_url not in self.product_image_urls:
             self.product_image_urls.append(image_url)
 
+    def _append_image_candidate(self, alt_text: str, image_url: str) -> None:
+        image_url = image_url.strip()
+        if image_url and not image_url.startswith("data:") and (alt_text, image_url) not in self.image_candidates:
+            self.image_candidates.append((alt_text.strip(), image_url))
+
 
 def extract_product_detail_candidate(
     html: str,
@@ -215,6 +255,7 @@ def extract_product_detail_candidate(
         return None
     description = _first_text(
         _json_text(json_ld_product, "description"),
+        _visible_product_description(title, parser.text_nodes),
         parser.meta.get("og:description", ""),
         parser.meta.get("description", ""),
     )
@@ -274,10 +315,11 @@ def extract_product_detail_candidate(
             product_url,
             _first_text(
                 _json_image(json_ld_product),
+                *parser.product_image_urls,
+                _title_matched_image(parser.image_candidates, title),
                 parser.meta.get("og:image", ""),
                 parser.meta.get("twitter:image", ""),
                 parser.meta.get("twitter:image:src", ""),
-                *parser.product_image_urls,
             ),
         ),
         raw_price=raw_price,
@@ -404,6 +446,71 @@ def _looks_like_image_url(value: str) -> bool:
         return False
     path = urlparse(value).path.casefold()
     return path.endswith((".avif", ".gif", ".jpeg", ".jpg", ".png", ".webp"))
+
+
+def _title_matched_image(image_candidates: list[tuple[str, str]], title: str) -> str:
+    normalized_title = _normalize_match_text(title)
+    if not normalized_title:
+        return ""
+    for alt_text, image_url in image_candidates:
+        normalized_alt = _normalize_match_text(alt_text)
+        if not normalized_alt:
+            continue
+        if normalized_alt == normalized_title or normalized_alt in normalized_title or normalized_title in normalized_alt:
+            return image_url
+    return ""
+
+
+def _visible_product_description(title: str, text_nodes: list[str]) -> str:
+    title_index = _visible_title_index(title, text_nodes)
+    if title_index < 0:
+        return ""
+
+    parts: list[str] = []
+    for text in text_nodes[title_index + 1 :]:
+        normalized = _normalize_match_text(text)
+        if _is_visible_description_stop(normalized):
+            break
+        if _is_visible_description_noise(text, normalized):
+            continue
+        parts.append(text)
+        if len(" ".join(parts)) >= 900:
+            break
+    return _collapse_text(" ".join(parts))
+
+
+def _visible_title_index(title: str, text_nodes: list[str]) -> int:
+    normalized_title = _normalize_match_text(title)
+    if not normalized_title:
+        return -1
+    for index, text in enumerate(text_nodes):
+        if _normalize_match_text(text) == normalized_title:
+            return index
+    return -1
+
+
+def _is_visible_description_stop(normalized_text: str) -> bool:
+    return any(normalized_text.startswith(prefix) for prefix in VISIBLE_DESCRIPTION_STOP_PREFIXES)
+
+
+def _is_visible_description_noise(text: str, normalized_text: str) -> bool:
+    if not normalized_text:
+        return True
+    if normalized_text in VISIBLE_DESCRIPTION_NOISE:
+        return True
+    if any(normalized_text.startswith(f"{prefix} ") or normalized_text.startswith(f"{prefix}:") for prefix in VISIBLE_DESCRIPTION_FACT_PREFIXES):
+        return True
+    _, price = _extract_price(text)
+    if price:
+        return True
+    _, availability = _extract_availability(text)
+    return availability != "unknown" and len(normalized_text.split()) <= 5
+
+
+def _normalize_match_text(value: str) -> str:
+    decomposed = unicodedata.normalize("NFKD", value.casefold())
+    without_accents = "".join(character for character in decomposed if not unicodedata.combining(character))
+    return " ".join(re.sub(r"[^a-z0-9]+", " ", without_accents).split())
 
 
 def _visible_product_heading(heading_parts: list[tuple[str, str]]) -> str:

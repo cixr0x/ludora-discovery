@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import os
 import re
+import unicodedata
 from pathlib import Path
+from urllib.parse import urlparse
 
 from ludora.webfetch import FetchResult
 
@@ -64,16 +66,29 @@ class BrowserTextFetcher:
             self._playwright.stop()
 
     def fetch(self, url: str) -> FetchResult | None:
-        if self._page is None:
+        page = self._context.new_page() if self._context is not None else self._page
+        close_page_after_fetch = self._context is not None
+        if page is None:
             raise BrowserFetchUnavailable("Browser fetcher has not been started.")
 
         try:
-            response = _navigate_past_reload_challenge(self._page, url, timeout_ms=self.timeout_ms)
+            response = _navigate_past_reload_challenge(page, url, timeout_ms=self.timeout_ms)
             if response is None:
-                return FetchResult(url=self._page.url, text=self._page.content())
-            return FetchResult(url=response.url, text=response.text())
+                return FetchResult(url=page.url, text=page.content())
+            if _is_xml_response(response):
+                return FetchResult(url=response.url, text=response.text())
+            _wait_for_rendered_html(
+                page,
+                url,
+                timeout_ms=self.timeout_ms,
+                timeout_error=self._playwright_timeout_error,
+            )
+            return FetchResult(url=page.url, text=page.content())
         except (self._playwright_error, self._playwright_timeout_error, OSError, ValueError):
             return None
+        finally:
+            if close_page_after_fetch:
+                page.close()
 
 
 def fetch_text_with_browser(url: str, timeout_ms: int = 30_000) -> FetchResult | None:
@@ -102,6 +117,79 @@ def _looks_like_reload_challenge(text: str) -> bool:
         or "<title>just a moment" in normalized
     )
     return has_reload_loop and has_challenge_title
+
+
+def _is_xml_response(response) -> bool:
+    content_type = str(response.headers.get("content-type", "")).casefold()
+    return "xml" in content_type and "html" not in content_type
+
+
+def _wait_for_rendered_html(page, url: str, *, timeout_ms: int, timeout_error) -> None:
+    try:
+        page.wait_for_load_state("load", timeout=timeout_ms)
+    except timeout_error:
+        pass
+
+    tokens = _significant_url_tokens(url)
+    if not tokens:
+        return
+
+    try:
+        page.wait_for_function(
+            """
+            tokens => {
+              const rawText = document.body && document.body.innerText || '';
+              const normalizedText = rawText
+                .normalize('NFD')
+                .replace(/[\\u0300-\\u036f]/g, '')
+                .toLowerCase();
+              const words = new Set((normalizedText.match(/[a-z0-9]+/g) || []));
+              const hasProductMarker = /\\$\\s*[0-9]/.test(rawText)
+                || words.has('cart')
+                || words.has('carrito')
+                || words.has('agotado')
+                || (words.has('sold') && words.has('out'));
+              return hasProductMarker && (tokens.length === 0 || tokens.some(token => words.has(token)));
+            }
+            """,
+            arg=tokens,
+            timeout=min(timeout_ms, 8_000),
+        )
+    except timeout_error:
+        pass
+
+
+def _significant_url_tokens(url: str) -> list[str]:
+    slug = urlparse(url).path.rstrip("/").rsplit("/", 1)[-1]
+    normalized = unicodedata.normalize("NFKD", slug.casefold()).encode("ascii", "ignore").decode("ascii")
+    ignored = {
+        "and",
+        "com",
+        "con",
+        "de",
+        "del",
+        "edicion",
+        "el",
+        "en",
+        "espanol",
+        "for",
+        "la",
+        "las",
+        "los",
+        "mx",
+        "ols",
+        "para",
+        "product",
+        "products",
+        "producto",
+        "productos",
+        "the",
+        "tienda",
+        "with",
+        "www",
+        "xn",
+    }
+    return [token for token in re.findall(r"[a-z0-9]+", normalized) if len(token) >= 4 and token not in ignored]
 
 
 def _chrome_executable_path() -> str | None:

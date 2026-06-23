@@ -158,5 +158,35 @@ Optional editable install:
 python -m pip install -e .
 ludora-collect-stores --dry-run-queries
 ```
+
+## Spanish Cover Asset Workflow
+
+Use the cover asset helper when a scraped store image has the right Spanish box art but needs a manual crop/perspective edit.
+
+Stage the source image and open it in GIMP:
+
+```powershell
+python .\scripts\cover_asset_workflow.py stage "https://store.example/game-box.jpg" --name "Catan Piratas y Exploradores" --s3-prefix "covers/es" --open-editor
+```
+
+Export the corrected flat cover from GIMP to the printed `edited.png` path. Then create the final WebP:
+
+```powershell
+python .\scripts\cover_asset_workflow.py finish ".\output\cover-assets\catan-piratas-y-exploradores" --public-base-url "https://cdn.example.com" --copy-url
+```
+
+To upload to S3 during `finish`, configure:
+
+```text
+LUDORA_COVER_S3_BUCKET=your-bucket
+LUDORA_COVER_S3_PREFIX=covers/es
+LUDORA_COVER_PUBLIC_BASE_URL=https://cdn.example.com
+```
+
+Then run:
+
+```powershell
+python .\scripts\cover_asset_workflow.py finish ".\output\cover-assets\catan-piratas-y-exploradores" --upload --copy-url
+```
 # ludora-search
 # ludora-discovery

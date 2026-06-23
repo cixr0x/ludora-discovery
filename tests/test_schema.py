@@ -190,15 +190,21 @@ class SchemaTests(unittest.TestCase):
         schema = schema_path.read_text(encoding="utf-8").casefold()
 
         self.assertIn("create or replace view active_item as", schema)
+        self.assertLess(schema.index("create table if not exists item_relationships"), schema.index("create or replace view active_item as"))
         view = schema.split("create or replace view active_item as", 1)[1].split(";", 1)[0]
 
-        self.assertIn("select i.*", view)
+        self.assertIn("i.*", view)
         self.assertIn("from items i", view)
         self.assertIn("where exists", view)
         self.assertIn("from store_items si", view)
         self.assertIn("si.item_id = i.id", view)
         self.assertIn("si.is_boardgame = true", view)
         self.assertIn("si.is_boardgame_confirmed = true", view)
+        self.assertIn("as has_approved_listing", view)
+        self.assertIn("si.listing_status = 'listed'", view)
+        self.assertIn("as is_expansion", view)
+        self.assertIn("ir.link_type = 'extension' and ir.item_a_id = i.id", view)
+        self.assertIn("ir.link_type = 'expansion' and ir.item_b_id = i.id", view)
 
     def test_schema_removes_offers_and_keeps_item_relationships(self):
         schema_path = Path(__file__).resolve().parents[2] / "database" / "schema.sql"

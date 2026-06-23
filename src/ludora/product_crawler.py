@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+import unicodedata
 from collections.abc import Callable
 from typing import Protocol
 from urllib.parse import urljoin, urlparse
@@ -137,24 +139,45 @@ def _fetch_detail_candidate(
     fetched_detail = fetch_html(listing_candidate.source_url)
     if fetched_detail is not None and _looks_like_site_protection_challenge(fetched_detail.text):
         fetched_detail = None
-    if fetched_detail is None and browser_fetcher is not None:
+
+    detail_candidate = (
+        extract_product_detail_candidate(
+            html=fetched_detail.text,
+            product_url=fetched_detail.url,
+            store_id=listing_candidate.store_id,
+            source_listing_url=source_listing_url,
+        )
+        if fetched_detail is not None
+        else None
+    )
+
+    if browser_fetcher is not None and (
+        fetched_detail is None or _should_retry_detail_with_browser(detail_candidate, listing_candidate)
+    ):
         fetched_detail = browser_fetcher(listing_candidate.source_url)
         if fetched_detail is not None and _looks_like_site_protection_challenge(fetched_detail.text):
             fetched_detail = None
-    if fetched_detail is None:
+        if fetched_detail is not None:
+            browser_detail_candidate = extract_product_detail_candidate(
+                html=fetched_detail.text,
+                product_url=fetched_detail.url,
+                store_id=listing_candidate.store_id,
+                source_listing_url=source_listing_url,
+            )
+            if browser_detail_candidate is not None:
+                detail_candidate = browser_detail_candidate
+
+    if detail_candidate is None or _should_retry_detail_with_browser(detail_candidate, listing_candidate):
         listing_candidate.source_listing_url = source_listing_url
         return listing_candidate
 
-    detail_candidate = extract_product_detail_candidate(
-        html=fetched_detail.text,
-        product_url=fetched_detail.url,
-        store_id=listing_candidate.store_id,
-        source_listing_url=source_listing_url,
-    )
-    if detail_candidate is None:
-        listing_candidate.source_listing_url = source_listing_url
-        return listing_candidate
+    return _apply_listing_fallbacks(detail_candidate, listing_candidate)
 
+
+def _apply_listing_fallbacks(
+    detail_candidate: DiscoveryItemCandidateRecord,
+    listing_candidate: DiscoveryItemCandidateRecord,
+) -> DiscoveryItemCandidateRecord:
     if not detail_candidate.raw_price:
         detail_candidate.raw_price = listing_candidate.raw_price
     if not detail_candidate.price:
@@ -164,6 +187,49 @@ def _fetch_detail_candidate(
         detail_candidate.availability = listing_candidate.availability
         detail_candidate.availability_source = listing_candidate.availability_source
     return detail_candidate
+
+
+def _should_retry_detail_with_browser(
+    detail_candidate: DiscoveryItemCandidateRecord | None,
+    listing_candidate: DiscoveryItemCandidateRecord,
+) -> bool:
+    if detail_candidate is None:
+        return True
+
+    title = detail_candidate.title.strip()
+    if not title:
+        return True
+    if "website uses cookies" in title.casefold():
+        return True
+
+    listing_tokens = _significant_listing_tokens(listing_candidate)
+    detail_tokens = _significant_text_tokens(title)
+    return bool(listing_tokens and detail_tokens and listing_tokens.isdisjoint(detail_tokens))
+
+
+def _significant_listing_tokens(listing_candidate: DiscoveryItemCandidateRecord) -> set[str]:
+    path_slug = urlparse(listing_candidate.source_url).path.rstrip("/").rsplit("/", 1)[-1]
+    return _significant_text_tokens(f"{listing_candidate.title} {path_slug}")
+
+
+def _significant_text_tokens(value: str) -> set[str]:
+    normalized = unicodedata.normalize("NFKD", value.casefold()).encode("ascii", "ignore").decode("ascii")
+    ignored = {
+        "product",
+        "products",
+        "producto",
+        "productos",
+        "tienda",
+        "ols",
+        "www",
+        "com",
+        "mx",
+        "xn",
+        "para",
+        "con",
+        "the",
+    }
+    return {token for token in re.findall(r"[a-z0-9]+", normalized) if len(token) >= 3 and token not in ignored}
 
 
 def _title_from_url(product_url: str) -> str:

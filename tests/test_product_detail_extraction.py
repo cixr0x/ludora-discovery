@@ -112,6 +112,48 @@ class ProductDetailExtractionTests(unittest.TestCase):
         self.assertEqual(record.availability, "available")
         self.assertEqual(record.availability_source, "generic_text")
 
+    def test_prefers_rendered_product_body_when_page_meta_is_stale(self):
+        html = """
+        <html lang="es-MX">
+          <head>
+            <title>7-Die Set Opaque Light Blue/white Chessex 25416</title>
+            <meta property="og:title" content="7-Die Set Opaque Light Blue/white Chessex 25416">
+            <meta property="og:description" content="Los dados opacos Chessex han sido el estandar durante decadas.">
+            <meta property="og:image" content="/images/blue-dice.jpg">
+          </head>
+          <body>
+            <h1>Catan</h1>
+            <img alt="Catan" src="/images/catan.jpg">
+            <p>$850.00 MXN</p>
+            <p>Almost Gone!</p>
+            <p>Quantity</p>
+            <p>Add to Cart</p>
+            <p>Idioma: Espa\u00f1ol</p>
+            <p>Jugadores: 3-4</p>
+            <p>Duraci\u00f3n: 75 minutos</p>
+            <p>Edad: 10+</p>
+            <p>Editorial: Devir / Kosmos</p>
+            <p>Sois los primeros colonos en llegar a la isla de Cat\u00e1n.</p>
+            <p>Pero enseguida el espacio en la isla empieza a escasear.</p>
+            <p>Copyright \u00a9 2020 AVALON - Todos los derechos reservados.</p>
+          </body>
+        </html>
+        """
+
+        record = extract_product_detail_candidate(
+            html,
+            "https://avalonstore.com.mx/tienda/ols/products/catan",
+            5,
+            "https://avalonstore.com.mx/sitemap.xml",
+        )
+
+        self.assertIsNotNone(record)
+        assert record is not None
+        self.assertEqual(record.title, "Catan")
+        self.assertIn("primeros colonos", record.description)
+        self.assertNotIn("dados opacos", record.description)
+        self.assertEqual(record.image_url, "https://avalonstore.com.mx/images/catan.jpg")
+
     def test_prefers_woocommerce_product_price_over_mini_cart_total(self):
         html = """
         <html lang="es-MX">

@@ -61,6 +61,37 @@ class SitemapDiscoveryTests(unittest.TestCase):
 
         self.assertEqual(urls, ["https://example.mx/products/catan"])
 
+    def test_follows_non_product_named_sitemaps_when_root_has_no_product_sitemap(self):
+        responses = {
+            "https://example.mx/sitemap.xml": """
+            <sitemapindex>
+              <sitemap><loc>https://example.mx/sitemap.website.xml</loc></sitemap>
+              <sitemap><loc>https://example.mx/sitemap.ols.xml</loc></sitemap>
+            </sitemapindex>
+            """,
+            "https://example.mx/sitemap.website.xml": """
+            <urlset>
+              <url><loc>https://example.mx/aviso-de-privacidad</loc></url>
+            </urlset>
+            """,
+            "https://example.mx/sitemap.ols.xml": """
+            <urlset>
+              <url><loc>https://example.mx/tienda/ols/products/catan</loc></url>
+            </urlset>
+            """,
+        }
+        fetched_urls = []
+
+        def fake_fetcher(url):
+            fetched_urls.append(url)
+            text = responses.get(url)
+            return FetchResult(url=url, text=text) if text is not None else None
+
+        urls = discover_product_urls_from_sitemaps("https://example.mx/", fetcher=fake_fetcher, limit=1)
+
+        self.assertEqual(urls, ["https://example.mx/tienda/ols/products/catan"])
+        self.assertIn("https://example.mx/sitemap.ols.xml", fetched_urls)
+
     def test_extracts_product_urls_from_cdata_loc_values(self):
         def fake_fetcher(url):
             return FetchResult(

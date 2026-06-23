@@ -4,6 +4,7 @@
 
 data/
 logs/
+output/
 
 __pycache__/
 *.py[cod]
