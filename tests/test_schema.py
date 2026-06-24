@@ -335,6 +335,7 @@ class SchemaTests(unittest.TestCase):
             "item_families",
             "item_contributors",
             "bgg_search_cache",
+            "bgg_thing_cache",
         ]:
             self.assertIn(f"create table if not exists {table_name}", schema)
 
@@ -384,6 +385,19 @@ class SchemaTests(unittest.TestCase):
         self.assertIn("result_json jsonb not null default '{}'::jsonb", search_cache_table)
         self.assertIn("first_seen_at timestamptz not null default now()", search_cache_table)
         self.assertIn("updated_at timestamptz not null default now()", search_cache_table)
+
+        thing_cache_table = schema.split("create table if not exists bgg_thing_cache", 1)[1].split(");", 1)[0]
+        self.assertIn("bgg_id bigint not null", thing_cache_table)
+        self.assertIn("request_type text not null default 'boardgame,boardgameexpansion'", thing_cache_table)
+        self.assertIn("raw_xml text not null", thing_cache_table)
+        self.assertIn("parsed_json jsonb not null default '{}'::jsonb", thing_cache_table)
+        self.assertIn("name text not null default ''", thing_cache_table)
+        self.assertIn("item_type text not null default ''", thing_cache_table)
+        self.assertIn("year_published integer", thing_cache_table)
+        self.assertIn("fetched_at timestamptz not null default now()", thing_cache_table)
+        self.assertIn("updated_at timestamptz not null default now()", thing_cache_table)
+        self.assertIn("unique (bgg_id, request_type)", thing_cache_table)
+        self.assertIn("bgg_thing_cache_bgg_id_idx", schema)
 
         search_queries_table = schema.split("create table if not exists bgg_search_queries", 1)[1].split(");", 1)[0]
         self.assertIn("query text not null", search_queries_table)

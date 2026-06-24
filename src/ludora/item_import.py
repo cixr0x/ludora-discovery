@@ -54,7 +54,7 @@ class BggItemImporter:
             parent_id = self._import_linked_thing(parent_link, current_visited)
             if parent_id:
                 with self.connection.cursor() as cursor:
-                    self._upsert_item_relationship(cursor, parent_id, "expansion", item_id, str(thing.bgg_id))
+                    self._upsert_item_relationship(cursor, item_id, "extension", parent_id, str(parent_link.bgg_id))
                     cursor.execute(
                         """
                         update items
@@ -69,8 +69,9 @@ class BggItemImporter:
         for implementation_link in thing.implementation_links:
             linked_id = self._import_linked_thing(implementation_link, current_visited)
             if linked_id:
+                item_a_id, item_b_id = _bgg_relationship_item_ids(item_id, linked_id, implementation_link)
                 with self.connection.cursor() as cursor:
-                    self._upsert_item_relationship(cursor, item_id, "implementation", linked_id, str(implementation_link.bgg_id))
+                    self._upsert_item_relationship(cursor, item_a_id, "implementation", item_b_id, str(implementation_link.bgg_id))
                 self.connection.commit()
 
         return item_id
@@ -284,8 +285,26 @@ class BggItemImporter:
     def _upsert_item_relationship(self, cursor: Any, item_a_id: int, link_type: str, item_b_id: int, source_ref: str) -> None:
         cursor.execute(
             """
+            with relationship_input as (
+                select
+                    %s::bigint as item_a_id,
+                    %s::text as link_type,
+                    %s::bigint as item_b_id,
+                    %s::text as source_ref
+            ),
+            removed_inverse_relationship as (
+                delete from item_relationships inverse_relationship
+                using relationship_input
+                where relationship_input.link_type in ('extension', 'implementation')
+                  and inverse_relationship.link_type = relationship_input.link_type
+                  and inverse_relationship.item_a_id = relationship_input.item_b_id
+                  and inverse_relationship.item_b_id = relationship_input.item_a_id
+                returning inverse_relationship.id
+            )
             insert into item_relationships (item_a_id, link_type, item_b_id, source, source_ref)
-            values (%s, %s, %s, 'BGG', %s)
+            select relationship_input.item_a_id, relationship_input.link_type, relationship_input.item_b_id, 'BGG', relationship_input.source_ref
+            from relationship_input
+            cross join (select count(*) as deleted_count from removed_inverse_relationship) inverse_cleanup
             on conflict (item_a_id, link_type, item_b_id) do update set
                 source = excluded.source,
                 source_ref = excluded.source_ref
@@ -300,6 +319,10 @@ def _bgg_type_to_item_type(value: str) -> str:
     if value == "boardgame":
         return "base_game"
     return "base_game"
+
+
+def _bgg_relationship_item_ids(current_item_id: int, linked_item_id: int, link: BggLink) -> tuple[int, int]:
+    return (current_item_id, linked_item_id) if link.inbound else (linked_item_id, current_item_id)
 
 
 def _bgg_url(thing: BggThing) -> str:

@@ -154,7 +154,7 @@ class BggImportTests(unittest.TestCase):
         self.assertTrue(any(alias[1] == "Catan: Extension 5-6 Jugadores" for alias in connection.cursor_instance.aliases))
         self.assertTrue(
             any(
-                relationship[1] == "expansion" and relationship[2] == item_id
+                relationship[0] == item_id and relationship[1] == "extension"
                 for relationship in connection.cursor_instance.relationships
             )
         )
@@ -162,6 +162,44 @@ class BggImportTests(unittest.TestCase):
             any("bgg_item_snapshots" in sql.casefold() for sql, _params in connection.cursor_instance.executions)
         )
         self.assertGreaterEqual(connection.commits, 1)
+
+    def test_imports_implementation_relationships_using_bgg_inbound_direction(self):
+        lancashire = BggThing(
+            bgg_id=28720,
+            item_type="boardgame",
+            name="Brass: Lancashire",
+        )
+        pittsburgh = BggThing(
+            bgg_id=452264,
+            item_type="boardgame",
+            name="Brass: Pittsburgh",
+        )
+        birmingham = BggThing(
+            bgg_id=224517,
+            item_type="boardgame",
+            name="Brass: Birmingham",
+            implementation_links=[
+                BggLink(bgg_id=452264, name="Brass: Pittsburgh", link_type="boardgameimplementation"),
+                BggLink(bgg_id=28720, name="Brass: Lancashire", link_type="boardgameimplementation", inbound=True),
+            ],
+        )
+        connection = FakeConnection()
+        importer = BggItemImporter(
+            connection,
+            bgg_client=FakeBggClient(
+                {
+                    28720: (lancashire, "<lancashire />"),
+                    452264: (pittsburgh, "<pittsburgh />"),
+                }
+            ),
+        )
+
+        birmingham_id = importer.import_thing(birmingham, "<birmingham />")
+        lancashire_id = connection.cursor_instance.items_by_bgg[28720][0]
+        pittsburgh_id = connection.cursor_instance.items_by_bgg[452264][0]
+
+        self.assertIn((birmingham_id, "implementation", lancashire_id, "28720"), connection.cursor_instance.relationships)
+        self.assertIn((pittsburgh_id, "implementation", birmingham_id, "452264"), connection.cursor_instance.relationships)
 
 
 if __name__ == "__main__":
